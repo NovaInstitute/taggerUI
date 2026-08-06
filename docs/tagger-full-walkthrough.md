@@ -1,0 +1,274 @@
+# Full Fluree and model-provider tagging walkthrough
+
+> Migration draft: this preserves the reviewer journey and expected screens.
+> The staged server still has legacy compatibility calls listed in
+> `taggerUI/ISSUES.md`, so the document is not yet an executable tutorial.
+
+This workflow processes the complete `forms.Rda` question set in explicit,
+checkpointed stages. A configured model provider creates embeddings and tag
+proposals, BERTopic infers the number of leaf topics, and Fluree stores
+questions, performs semantic retrieval, and keeps proposals on a separate AI
+branch.
+
+## 1. Prerequisites
+
+- Fluree is reachable at `http://localhost:8090`.
+- `~/Downloads/forms.Rda` contains the `forms` object.
+- OpenAI credentials are available, or Ollama is reachable for inexpensive
+  local testing.
+- The BERTopic Python environment is available through `reticulate`.
+
+From the package directory:
+
+```r
+devtools::load_all("taggerUI")
+
+check_bertopic_environment()
+fluree_health_check(fluree_config())
+```
+
+If BERTopic dependencies are missing, install them once with
+`install_bertopic_environment()`, restart R, and run the readiness check again.
+
+## 2. Launch the visual walkthrough
+
+```r
+devtools::load_all("taggerUI")
+run_fluree_tagger_app()
+```
+
+The interface defaults to `~/Downloads/forms.Rda`, the local Fluree endpoint,
+and OpenAI. Select Ollama to use a local test provider. Provider URL,
+credentials, and model IDs remain editable so a run can be pinned to a
+particular provider configuration and model snapshot.
+
+Work through the numbered buttons:
+
+1. **Load questions** flattens and deduplicates the full forms data.
+2. **Embed questions** sends captions through the selected provider in batches.
+   Each completed batch is stored once as Fluree question/vector entities on
+   `main`; the AI branch receives only lightweight workflow checkpoints.
+   Resume reloads completed vectors from Fluree by question ID and embedding
+   model, without copying the vector matrix into every run revision.
+3. **Infer hierarchy with BERTopic** discovers leaf topics and derives the
+   broader levels automatically. The resulting sequence is shown above the
+   graph. BERTopic runs in a clean child R/Python process with single-worker
+   UMAP and HDBSCAN settings. A native Python failure therefore produces a
+   worker-log error without terminating Shiny or damaging the embedding
+   checkpoint.
+4. **Publish vectors for evidence** verifies that vectors written during
+   embedding are available on `main` and marks the run ready for retrieval.
+   Runs created with a non-Fluree store still perform the full idempotent vector
+   upsert at this step. Tag proposals never write to `main`.
+5. **Tag next cluster** performs one fully inspectable cycle. **Tag current
+   level** repeats that cycle for every pending cluster in the current level.
+6. The **Review** tab lets a person accept, edit, reject, or defer every
+   proposal. Meaningful decisions are persisted as immutable review events on
+   the AI branch, alongside a convenient current-state projection. Selecting a
+   proposal shows every question in the cluster, its child tags, and the cosine
+   similarity/distance between each question embedding and the proposed-tag
+   embedding. Questions are ordered farthest-first to make weakly represented
+   members easy to spot. Saving an edited tag recomputes these values.
+
+The graph updates after every cluster. Grey nodes are pending, amber nodes are
+proposed, green nodes are accepted/edited, and red nodes are rejected.
+
+## 3. What happens during one tagging cycle
+
+For the next pending bottom-up cluster, the controller:
+
+1. calculates the centroid of the cluster's provider embeddings;
+2. sends a Fluree query containing that centroid, its dimension, the embedding
+   model constraint, the cosine-similarity expression, ordering, and limit;
+3. receives similar questions and excludes questions already in the cluster;
+4. builds a model prompt containing representative/outlier questions, child
+   tags, and the similar questions returned by Fluree;
+5. sends the prompt through the model-provider adapter and parses the JSON
+   proposal;
+6. writes the proposal, evidence, tag embedding, and resumable state together
+   through one authoritative tag-store transaction on the isolated Fluree AI
+   branch.
+
+The **Inspect I/O** tab records these as separate request and response events.
+It shows prompts, question text, Fluree query structure, similarity scores,
+model outputs, HTTP statuses, and returned transaction data. Raw embedding
+arrays are deliberately represented as `{ "__vector__": true, "dimension": N }`
+because printing thousands of full vectors would make the audit log unusable.
+
+No API key or Authorization header is recorded.
+
+## 4. Equivalent step-by-step R code
+
+Use this version to pause and inspect objects directly in the console:
+
+```r
+devtools::load_all("taggerUI")
+
+events <- list()
+capture_event <- function(event) {
+  events[[length(events) + 1L]] <<- event
+  cat("\n", event$system, event$direction,
+      event$operation %||% event$endpoint, "\n")
+  cat(jsonlite::toJSON(event, auto_unbox = TRUE, pretty = TRUE), "\n")
+}
+
+run_id <- "survey-review-2026-01"
+branch <- fluree_ai_branch_name(run_id)
+
+fluree <- fluree_config(
+  base_url = "http://localhost:8090",
+  ledger = "survey-tagger",
+  ai_branch = branch,
+  trace_callback = capture_event
+)
+store <- prepare_fluree_tag_store(fluree, run_id, branch)
+
+run <- new_tagger_walkthrough(
+  forms_path = "~/Downloads/forms.Rda",
+  limit_n = Inf,
+  store = store,
+  run_id = run_id,
+  event_callback = capture_event
+)
+
+provider <- openai_model_provider(openai_config(
+  embed_model = "text-embedding-3-small",
+  tagger_model = "gpt-5.4-mini"
+))
+
+# For local testing, the rest of the workflow is unchanged:
+# provider <- ollama_model_provider(ollama_config(
+#   embed_model = "nomic-embed-text",
+#   tagger_model = "llama3.1:8b"
+# ))
+
+run <- walkthrough_embed(
+  run,
+  provider = provider,
+  batch_size = 100,
+  event_callback = capture_event,
+  progress_callback = function(done, total, label) message(label)
+)
+
+run <- walkthrough_infer_bertopic(
+  run,
+  event_callback = capture_event
+)
+
+run$state$clusters_by_level
+run$state$clusters
+
+run <- walkthrough_prepare_fluree(
+  run,
+  config = fluree,
+  event_callback = capture_event
+)
+
+run$fluree_config$ai_branch
+walkthrough_next_cluster(run)
+
+# Run exactly one Fluree retrieval + model proposal cycle.
+run <- walkthrough_tag_next(
+  run,
+  provider = provider,
+  evidence_limit = 5,
+  precedent_limit = 6,
+  guidance_limit = 8,
+  sample_size = 5,
+  event_callback = capture_event
+)
+
+run$proposals[[1]]
+walkthrough_next_cluster(run)
+
+# Human review example (use the key shown in names(run$proposals)).
+proposal_key <- names(run$proposals)[[1]]
+parts <- strsplit(proposal_key, ":", fixed = TRUE)[[1]]
+run <- walkthrough_review_tag(
+  run,
+  level = parts[[1]],
+  cluster_id = parts[[2]],
+  decision = "accepted",
+  event_callback = capture_event
+)
+```
+
+The proposal contains `evidence$questions` and `evidence$precedents`.
+Precedents are reviewed proposals retrieved from Fluree with the same embedding
+model and dimension. Accepted and edited labels guide the model positively;
+rejected labels are explicit counterexamples. Setting `precedent_limit = 0`
+disables this retrieval without changing the rest of the workflow.
+
+Reusable guidance is deliberately more controlled than precedents:
+
+```r
+guidance <- new_tagging_guidance(
+  "Use a measured concept rather than the survey's procedural wording.",
+  kind = "constraint",
+  tags = c("labels", "concepts"),
+  rationale = "The same concept appears under several legacy captions.",
+  severity = "should"
+)
+guidance <- approve_tagging_guidance(guidance, reviewer_id = "reviewer-1")
+fluree_upsert_tagging_guidance(
+  guidance, fluree, branch = fluree$main_branch
+)
+```
+
+Only approved guidance is recalled. The app shows the applied records
+read-only, and every proposal stores those records in `evidence$guidance`.
+Set `guidance_limit = 0` to disable guidance recall.
+
+The app's **Guidance** tab is the normal review surface:
+
+1. create a candidate with text, kind, tags, and rationale;
+2. select it and approve or reject it with a stable reviewer ID;
+3. retire an approved rule when it should no longer affect new proposals; or
+4. supersede it to preserve the old rule and create a replacement candidate.
+
+Reject, retire, and supersede require a rationale. A replacement is not active
+until it receives its own approval. The tab also lists tag proposals on the
+active AI branch that used the selected guidance.
+
+Resume later without repeating completed embedding batches, clustering, or
+review work:
+
+```r
+fluree <- fluree_config(
+  ledger = "survey-tagger",
+  ai_branch = "ai-run-survey-review-2026-01"
+)
+store <- fluree_tag_store(
+  fluree,
+  run_id = "survey-review-2026-01",
+  branch = fluree$ai_branch
+)
+run <- load_tagger_walkthrough(store, fluree)
+```
+
+`fluree_list_tag_runs(fluree, branch)` lists resumable runs on a known branch.
+A local RDS checkpoint is available only as an explicit debugging option and
+is not the authoritative project record.
+
+`isolate = TRUE` is the default for `walkthrough_infer_bertopic()` and is
+recommended for full runs. Set `isolate = FALSE` only when debugging Python
+interactively on a small sample.
+
+## 5. Agent and MCP boundary
+
+The UI is only a controller. The reusable operations are already separate:
+
+- `walkthrough_next_cluster()` selects work;
+- `fluree_search_cluster_evidence()` is the semantic retrieval tool;
+- `fluree_search_tag_precedents()` retrieves reviewer-approved examples and
+  rejected counterexamples;
+- `fluree_search_tagging_guidance()` retrieves explicitly approved reusable
+  rules from the stable project branch;
+- `cluster_tag_prompt()` builds agent context;
+- `walkthrough_tag_next()` proposes and persists a tag; and
+- `walkthrough_review_tag()` applies human review.
+
+An MCP server can later expose these operations as tools without moving the
+clustering, Fluree, or review logic into the UI. The agent can then perform the
+same single-cluster loop while the app continues to display the shared event
+stream and checkpoint state.

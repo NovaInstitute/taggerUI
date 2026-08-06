@@ -1,0 +1,25 @@
+Package: taggerUI
+Type: Package
+Title: Survey Tagging Reviewer Interface
+Version: 0.0.0.9000
+Authors@R: person("Nova Institute", role = c("aut", "cre"), email = "maintainers@example.com")
+Description: A Shiny reviewer interface for importing survey knowledge and
+    reviewing question clusters, tag proposals, evidence, and structural edits.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Depends: R (>= 4.2)
+Imports:
+    dplyr,
+    jsonlite,
+    shiny,
+    tibble
+Suggests:
+    DT,
+    novaGraphDB,
+    novaRush,
+    novaTagger,
+    testthat,
+    visNetwork
+Config/testthat/edition: 3
