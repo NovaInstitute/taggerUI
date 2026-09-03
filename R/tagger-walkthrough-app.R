@@ -1,875 +1,845 @@
-# Staged from the combined prototype. Cross-package calls are tracked in
-# taggerUI/ISSUES.md and will be replaced incrementally with public APIs.
-.walkthrough_has_clusters <- function(run) {
-  clusters <- run$state$clusters %||% NULL
-  is.data.frame(clusters) &&
-    nrow(clusters) > 0L &&
-    all(c(
-      "level", "cluster_id", "parent_cluster", "question_ids", "tag"
-    ) %in% names(clusters))
+# Guided Shiny interface over the public novaRush and novaTagger APIs.
+
+.tagger_default_scope <- function(ledger) {
+  paste0("https://data.nova.org/integration/", trimws(ledger), "/")
 }
 
-.walkthrough_leaf_ids <- function(run) {
-  assignments <- run$state$assignments %||% NULL
-  if (!is.data.frame(assignments) ||
-      !"cluster_level_1" %in% names(assignments)) {
-    return(character())
-  }
-  ids <- unique(as.character(assignments$cluster_level_1))
-  ids[!is.na(ids) & nzchar(ids)]
+.tagger_default_survey_graph <- function(ledger) {
+  paste0(.tagger_default_scope(ledger), "graph/survey")
 }
 
-.walkthrough_has_hierarchy <- function(run) {
-  .walkthrough_has_clusters(run) && length(.walkthrough_leaf_ids(run)) > 0L
+.tagger_default_graph_base <- function(ledger, run_id) {
+  paste0(
+    .tagger_default_scope(ledger), "graph/tagging/openai/",
+    trimws(run_id), "/"
+  )
 }
 
-.walkthrough_graph_data <- function(run) {
-  if (!.walkthrough_has_clusters(run)) {
+.tagger_graphs <- function(base) {
+  base <- paste0(sub("/+$", "", trimws(base)), "/")
+  stats::setNames(paste0(base, c("run", "embedding", "hierarchy", "review")),
+                  c("run", "embedding", "hierarchy", "review")) |>
+    as.list()
+}
+
+.tagger_cluster_status <- function(state, level, cluster_id) {
+  proposal <- .quality_latest_proposal(state, level, cluster_id)
+  if (is.null(proposal)) "pending" else proposal$status %||% "pending"
+}
+
+.tagger_hierarchy_graph <- function(workflow) {
+  if (is.null(workflow) || !is.data.frame(workflow$state$clusters) ||
+      !nrow(workflow$state$clusters)) {
     return(list(nodes = data.frame(), edges = data.frame()))
   }
-  clusters <- run$state$clusters
-  keys <- paste(clusters$level, clusters$cluster_id, sep = ":")
-  status <- vapply(keys, function(key) (run$proposals[[key]] %||% list(status = "pending"))$status %||% "pending", character(1))
-  label <- ifelse(is.na(clusters$tag) | !nzchar(clusters$tag),
-                  paste0("L", clusters$level, " / C", clusters$cluster_id), clusters$tag)
+  clusters <- workflow$state$clusters
+  status <- vapply(seq_len(nrow(clusters)), function(i) {
+    .tagger_cluster_status(
+      workflow$state, clusters$level[[i]], clusters$cluster_id[[i]]
+    )
+  }, character(1))
+  label <- ifelse(
+    is.na(clusters$tag) | !nzchar(clusters$tag),
+    paste0("L", clusters$level, " / C", clusters$cluster_id),
+    clusters$tag
+  )
   nodes <- data.frame(
     id = paste0("L", clusters$level, "C", clusters$cluster_id),
     label = label,
-    level = -clusters$level,
+    level = -as.integer(clusters$level),
     group = status,
-    title = paste0("level ", clusters$level, "; cluster ", clusters$cluster_id,
-                   "; questions ", lengths(clusters$question_ids), "; status ", status),
+    title = paste0(
+      "Level ", clusters$level, "; cluster ", clusters$cluster_id,
+      "; questions ", lengths(clusters$question_ids), "; status ", status
+    ),
     stringsAsFactors = FALSE
   )
-  edges <- list()
-  k <- 0L
-  for (i in seq_len(nrow(clusters))) {
-    if (is.na(clusters$parent_cluster[[i]])) next
-    k <- k + 1L
-    edges[[k]] <- data.frame(
+  quality <- .cluster_node_quality(workflow$state)
+  quality_hit <- match(paste(clusters$level, clusters$cluster_id, sep = ":"),
+                       quality$key)
+  nodes$color.border <- ifelse(quality$flagged[quality_hit], "#d1495b", "#6c757d")
+  nodes$borderWidth <- ifelse(quality$flagged[quality_hit], 4, 1)
+  nodes$title <- paste0(
+    nodes$title, "; quality warnings ", quality$warning_count[quality_hit]
+  )
+  edges <- lapply(seq_len(nrow(clusters)), function(i) {
+    if (is.na(clusters$parent_cluster[[i]])) return(NULL)
+    data.frame(
       from = paste0("L", clusters$level[[i]], "C", clusters$cluster_id[[i]]),
-      to = paste0("L", clusters$level[[i]] + 1L, "C", clusters$parent_cluster[[i]]),
+      to = paste0(
+        "L", clusters$level[[i]] + 1L, "C", clusters$parent_cluster[[i]]
+      ),
       stringsAsFactors = FALSE
     )
-  }
+  })
   list(nodes = nodes, edges = dplyr::bind_rows(edges))
+}
+
+.tagger_progress_table <- function(workflow, questions) {
+  question_count <- if (is.null(questions)) 0L else nrow(questions)
+  state <- if (is.null(workflow)) NULL else workflow$state
+  embedded <- if (is.null(state) || is.null(state$embeddings)) {
+    0L
+  } else if (is.matrix(state$embeddings)) {
+    nrow(state$embeddings)
+  } else {
+    sum(!vapply(state$embeddings, is.null, logical(1)))
+  }
+  clusters <- if (is.null(state)) NULL else state$clusters %||% NULL
+  cluster_count <- if (is.data.frame(clusters)) nrow(clusters) else 0L
+  tagged <- if (cluster_count) {
+    sum(!is.na(clusters$tag) & nzchar(clusters$tag) & clusters$tag != "untagged")
+  } else 0L
+  proposals <- if (is.null(state)) 0L else length(state$proposals %||% list())
+  reviews <- if (is.null(state)) 0L else length(state$review_events %||% list())
+  tibble::tibble(
+    step = c("Questions", "Embeddings", "Hierarchy", "Proposals", "Reviews"),
+    status = c(
+      if (question_count) "ready" else "waiting",
+      if (embedded == question_count && question_count) "complete" else
+        if (embedded) "in progress" else "waiting",
+      if (cluster_count) "complete" else "waiting",
+      if (proposals) "in progress" else "waiting",
+      if (reviews) "in progress" else "waiting"
+    ),
+    progress = c(
+      paste0(question_count, " loaded"),
+      paste0(embedded, " / ", question_count),
+      paste0(cluster_count, " clusters"),
+      paste0(proposals, " proposals"),
+      paste0(reviews, " decisions; ", tagged, " / ", cluster_count, " tagged")
+    )
+  )
 }
 
 .walkthrough_app_ui <- function() {
   shiny::navbarPage(
     "Survey tagger walkthrough",
     shiny::tabPanel(
-      "Run",
+      "1. Connect & resume",
       shiny::sidebarLayout(
         shiny::sidebarPanel(
-          shiny::textInput("forms_path", "Forms file", path.expand("~/Downloads/forms.Rda")),
-          shiny::textInput("run_id", "Run ID", ""),
-          shiny::checkboxInput("full_set", "Use complete unique question set", value = TRUE),
-          shiny::numericInput("limit_n", "Question limit", value = 3023, min = 1, step = 1),
-          shiny::actionButton("load_questions", "Create run + load questions", class = "btn-primary"),
-          shiny::actionButton("resume_run", "Resume Fluree run"),
-          shiny::hr(),
-          shiny::selectInput("model_provider", "Model provider", c("OpenAI" = "openai", "Ollama" = "ollama")),
-          shiny::textInput("model_base_url", "Provider URL", "https://api.openai.com/v1"),
-          shiny::passwordInput("provider_key", "API key", placeholder = "Uses OPENAI_API_KEY for OpenAI when blank"),
-          shiny::textInput("embed_model", "Embedding model", "text-embedding-3-small"),
-          shiny::textInput("tag_model", "Tagging model", "gpt-5.4-mini"),
-          shiny::numericInput("batch_size", "Embedding batch size", 100, min = 1, max = 500),
-          shiny::actionButton("embed", "1. Embed questions"),
-          shiny::actionButton("cluster", "2. Infer hierarchy with BERTopic"),
-          shiny::hr(),
           shiny::textInput("fluree_url", "Fluree URL", "http://localhost:8090"),
-          shiny::textInput("ledger", "Ledger", "survey-tagger"),
-          shiny::textInput("ai_branch", "AI branch (blank = timestamped)", ""),
-          shiny::numericInput("fluree_batch_size", "Fluree questions per request", 50, min = 1, max = 500),
-          shiny::actionButton("prepare_fluree", "3. Publish vectors for evidence"),
+          shiny::textInput("ledger", "Ledger", ""),
+          shiny::textInput("branch", "Branch", "main"),
+          shiny::passwordInput(
+            "fluree_key", "Fluree API key",
+            placeholder = "Uses FLUREE_API_KEY when blank"
+          ),
+          shiny::numericInput("fluree_timeout", "Request timeout (seconds)", 300,
+                              min = 10, max = 3600),
           shiny::hr(),
-          shiny::numericInput("evidence_limit", "Similar questions per cluster", 5, min = 0, max = 30),
-          shiny::numericInput("precedent_limit", "Reviewed precedents per cluster", 6, min = 0, max = 30),
-          shiny::numericInput("guidance_limit", "Approved guidance records", 8, min = 0, max = 30),
-          shiny::numericInput("sample_size", "Cluster examples", 5, min = 1, max = 20),
-          shiny::actionButton("tag_next", "4. Tag next cluster", class = "btn-primary"),
-          shiny::actionButton("tag_level", "Tag current level")
+          shiny::textInput("survey_graph", "Survey named graph", ""),
+          shiny::numericInput("query_page_size", "Query page size", 200,
+                              min = 1, max = 2000),
+          shiny::actionButton(
+            "load_questions", "Load stored questions", class = "btn-primary"
+          ),
+          shiny::hr(),
+          shiny::textInput("run_id", "Tagging run ID", ""),
+          shiny::textInput("tagging_graph_base", "Tagging graph base", ""),
+          shiny::numericInput("tag_batch_size", "Persistence batch size", 50,
+                              min = 1, max = 500),
+          shiny::actionButton("resume_run", "Resume tagging run")
         ),
         shiny::mainPanel(
           shiny::fluidRow(
-            shiny::column(3, shiny::wellPanel(shiny::h4("Stage"), shiny::textOutput("stage"))),
-            shiny::column(3, shiny::wellPanel(shiny::h4("Run / branch"), shiny::textOutput("run_identity"))),
-            shiny::column(3, shiny::wellPanel(shiny::h4("Questions"), shiny::textOutput("question_count"))),
-            shiny::column(3, shiny::wellPanel(shiny::h4("Tag progress"), shiny::textOutput("tag_progress")))
+            shiny::column(4, shiny::wellPanel(
+              shiny::h4("Connection"), shiny::textOutput("connection_status")
+            )),
+            shiny::column(4, shiny::wellPanel(
+              shiny::h4("Run"), shiny::textOutput("run_status")
+            )),
+            shiny::column(4, shiny::wellPanel(
+              shiny::h4("Current stage"), shiny::textOutput("stage_status")
+            ))
           ),
-          shiny::h4("Automatically inferred hierarchy"),
-          shiny::textOutput("hierarchy_summary"),
-          visNetwork::visNetworkOutput("hierarchy", height = "620px")
+          shiny::h3("Tagging walkthrough"),
+          shiny::p(
+            "The application reads authoritative survey and tagging state from ",
+            "Fluree. Loading questions does not modify the ledger. Resuming a ",
+            "run reconstructs its latest persisted revision."
+          ),
+          DT::DTOutput("walkthrough_progress"),
+          shiny::h4("Stored survey summary"),
+          DT::DTOutput("question_counts")
         )
       )
     ),
     shiny::tabPanel(
-      "Inspect I/O",
-      shiny::p("Every Fluree and OpenAI request and response appears here. Vector values are intentionally replaced by their dimension; prompts, question text, query structure, scores, and model output remain visible."),
-      DT::DTOutput("event_table"),
-      shiny::h4("Selected event payload"),
-      shiny::verbatimTextOutput("event_detail")
-    ),
-    shiny::tabPanel(
-      "Review",
+      "2. Inspect questions",
       shiny::fluidRow(
-        shiny::column(5,
-          shiny::selectInput("review_cluster", "Proposed cluster", choices = character()),
-          shiny::textInput("edited_tag", "Tag label"),
-          shiny::actionButton("accept_tag", "Accept", class = "btn-primary"),
-          shiny::actionButton("edit_tag", "Save edit"),
-          shiny::actionButton("reject_tag", "Reject"),
-          shiny::actionButton("refresh_similarity", "Recompute tag distances")
+        shiny::column(
+          3,
+          shiny::selectInput(
+            "question_class_filter", "Question class",
+            choices = c("All" = "all", "Open" = "open", "Closed" = "closed")
+          ),
+          shiny::checkboxInput("repeat_only", "Only questions in repeat groups"),
+          shiny::textInput("question_search", "Search caption, field, or option"),
+          shiny::p(
+            "Select a row to inspect its nested answer options and complete ",
+            "novaTagger projection."
+          )
         ),
-        shiny::column(7,
-          shiny::h4("Proposal"),
-          shiny::verbatimTextOutput("proposal_detail"),
-          shiny::textOutput("review_similarity_summary")
-        )
+        shiny::column(9, DT::DTOutput("question_table"))
       ),
-      shiny::h4("Child tags"),
-      DT::DTOutput("review_children"),
-      shiny::h4("Accepted or edited precedents"),
-      DT::DTOutput("review_positive_precedents"),
-      shiny::h4("Rejected precedents"),
-      DT::DTOutput("review_negative_precedents"),
-      shiny::h4("Applied reviewer-approved guidance"),
-      DT::DTOutput("review_guidance"),
-      shiny::h4("Questions in this cluster"),
-      shiny::p("Farthest questions are shown first. Cosine distance is 0 for identical direction and increases as semantic alignment weakens."),
-      DT::DTOutput("review_questions")
+      shiny::fluidRow(
+        shiny::column(
+          6, shiny::h4("Nested answer options"), DT::DTOutput("option_table")
+        ),
+        shiny::column(
+          6, shiny::h4("Selected question record"),
+          shiny::verbatimTextOutput("question_record")
+        )
+      )
     ),
     shiny::tabPanel(
-      "Cluster diagnostics",
+      "3. Hierarchy & quality",
+      shiny::h3("Hierarchy progress and cluster quality"),
+      shiny::p(
+        "Node fill shows review status. A red border flags centroid outliers, ",
+        "questions outside the proposed tag scope, or a materially better ",
+        "alternative cluster. Select a node or use the cluster list below."
+      ),
+      visNetwork::visNetworkOutput("hierarchy", height = "520px"),
       shiny::fluidRow(
         shiny::column(
           4,
-          shiny::selectInput("diagnostic_cluster", "Inspect leaf cluster", choices = character()),
-          shiny::selectInput("destination_cluster", "Move selected questions to", choices = character()),
-          shiny::textInput("structure_reviewer", "Reviewer ID", "reviewer"),
-          shiny::textAreaInput("structure_rationale", "Reason for move", rows = 3),
-          shiny::actionButton("preview_reclassification", "Preview move", class = "btn-primary"),
-          shiny::actionButton("apply_reclassification", "Apply preview"),
-          shiny::actionButton("discard_reclassification", "Discard preview")
+          shiny::h4("Selected cluster"),
+          shiny::selectInput("quality_cluster", "Cluster", choices = character()),
+          shiny::verbatimTextOutput("hierarchy_summary"),
+          shiny::h4("Quality summary"),
+          DT::DTOutput("cluster_quality_summary"),
+          shiny::h4("Parent, children, and siblings"),
+          DT::DTOutput("cluster_context")
         ),
         shiny::column(
           8,
-          shiny::p("The 2D PCA view is for navigation. Flags and placement recommendations use the original embedding dimensions."),
-          shiny::plotOutput(
-            "diagnostic_plot", height = "520px",
-            click = "diagnostic_plot_click", brush = "diagnostic_plot_brush"
-          )
+          shiny::p(
+            "The PCA plot is a two-dimensional navigation view only. All ",
+            "quality flags and placement recommendations use the original ",
+            "embedding dimensions."
+          ),
+          shiny::plotOutput("cluster_pca", height = "480px"),
+          shiny::h4("Questions ranked by concern"),
+          shiny::p(
+            "Low centroid or tag similarity appears first. A positive placement ",
+            "margin means another cluster centroid is closer."
+          ),
+          DT::DTOutput("cluster_quality_questions")
         )
       ),
-      shiny::h4("Flagged clusters"),
-      DT::DTOutput("diagnostic_clusters"),
-      shiny::h4("Questions in selected cluster"),
-      shiny::p("Select one or more rows to preview reclassification. Lowest-fit questions appear first."),
-      DT::DTOutput("diagnostic_questions"),
-      shiny::h4("Ranked placements for selected questions"),
-      DT::DTOutput("diagnostic_placements"),
-      shiny::h4("Preview metrics"),
-      DT::DTOutput("reclassification_metrics")
+      shiny::h4("All cluster quality flags"),
+      DT::DTOutput("all_cluster_quality")
     ),
     shiny::tabPanel(
-      "Guidance",
-      shiny::fluidRow(
-        shiny::column(
-          5,
-          shiny::h4("Create candidate"),
-          shiny::textAreaInput(
-            "guidance_text", "Reusable guidance", rows = 4
+      "4. Review tags",
+      shiny::sidebarLayout(
+        shiny::sidebarPanel(
+          shiny::h4("OpenAI provider"),
+          shiny::textInput("openai_base_url", "API URL", "https://api.openai.com/v1"),
+          shiny::passwordInput(
+            "openai_key", "OpenAI API key",
+            placeholder = "Uses OPENAI_API_KEY when blank"
           ),
-          shiny::selectInput(
-            "guidance_kind", "Kind",
-            choices = c("Constraint" = "constraint", "Decision" = "decision",
-                        "Fact" = "fact")
-          ),
-          shiny::textInput(
-            "guidance_tags", "Tags (comma-separated)", "labels"
-          ),
-          shiny::selectInput(
-            "guidance_severity", "Constraint severity",
-            choices = c("None" = "", "Must" = "must", "Should" = "should",
-                        "Prefer" = "prefer")
-          ),
-          shiny::textAreaInput(
-            "guidance_candidate_rationale", "Candidate rationale", rows = 2
-          ),
+          shiny::textInput("tag_model", "Generation model", "gpt-5.4-mini"),
+          shiny::textInput("tag_embed_model", "Embedding model", "text-embedding-3-small"),
+          shiny::numericInput("tag_sample_size", "Cluster examples", 8,
+                              min = 1, max = 50),
           shiny::actionButton(
-            "create_guidance", "Save candidate", class = "btn-primary"
-          )
+            "generate_proposal", "Generate next proposal", class = "btn-primary"
+          ),
+          shiny::textOutput("model_activity"),
+          shiny::hr(),
+          shiny::h4("Review proposal"),
+          shiny::selectInput("proposal_id", "Proposal", choices = character()),
+          shiny::textInput("edited_tag", "Tag label"),
+          shiny::textInput("reviewer_id", "Reviewer ID", "reviewer"),
+          shiny::textAreaInput("review_rationale", "Reviewer rationale", rows = 3),
+          shiny::actionButton("accept_proposal", "Accept", class = "btn-success"),
+          shiny::actionButton("edit_proposal", "Save edit", class = "btn-primary"),
+          shiny::actionButton("reject_proposal", "Reject", class = "btn-danger"),
+          shiny::actionButton("defer_proposal", "Defer")
         ),
-        shiny::column(
-          7,
-          shiny::h4("Review selected guidance"),
-          shiny::textInput("guidance_reviewer", "Reviewer ID", "reviewer"),
-          shiny::textAreaInput(
-            "guidance_review_rationale", "Review rationale", rows = 3
+        shiny::mainPanel(
+          shiny::h3("Next cluster awaiting a proposal"),
+          DT::DTOutput("next_cluster"),
+          DT::DTOutput("next_cluster_questions"),
+          shiny::hr(),
+          shiny::h3("Selected proposal"),
+          shiny::verbatimTextOutput("proposal_detail"),
+          shiny::fluidRow(
+            shiny::column(5, shiny::h4("Similarity summary"),
+                          DT::DTOutput("proposal_similarity_summary")),
+            shiny::column(7, shiny::h4("Review history"),
+                          DT::DTOutput("proposal_review_history"))
           ),
-          shiny::textAreaInput(
-            "guidance_replacement", "Replacement text for supersession", rows = 3
-          ),
-          shiny::actionButton("approve_guidance", "Approve"),
-          shiny::actionButton("reject_guidance", "Reject"),
-          shiny::actionButton("retire_guidance", "Retire"),
-          shiny::actionButton("supersede_guidance", "Supersede"),
-          shiny::actionButton("refresh_guidance", "Refresh")
+          shiny::h4("Questions scored against the proposed tag"),
+          DT::DTOutput("proposal_questions"),
+          shiny::h4("All proposals in this run"),
+          DT::DTOutput("proposal_table")
         )
-      ),
-      shiny::p(
-        "Only approved guidance is supplied to the tagging model. Reject, ",
-        "retire, and supersede actions require an explanation."
-      ),
-      DT::DTOutput("guidance_table"),
-      shiny::h4("Selected guidance provenance"),
-      shiny::verbatimTextOutput("guidance_detail"),
-      shiny::h4("Proposals using selected guidance on the active AI branch"),
-      DT::DTOutput("guidance_usage")
-    ),
-    shiny::tabPanel(
-      "Questions & cost",
-      shiny::h4("Question preview"),
-      DT::DTOutput("questions"),
-      shiny::h4("Planning estimate (USD)"),
-      shiny::tableOutput("cost")
+      )
     )
   )
 }
 
 .walkthrough_app_server <- function(input, output, session) {
   rv <- shiny::reactiveValues(
-    run = NULL, events = list(), structure_preview = NULL,
-    guidance = .empty_tagging_guidance()
+    questions = NULL, workflow = NULL, store = NULL,
+    connection_message = "Not connected",
+    model_message = "No model request in this session"
   )
-  event_callback <- function(event) {
-    shiny::isolate(rv$events <- c(rv$events, list(event)))
-  }
-  provider_config <- shiny::reactive({
-    if (identical(input$model_provider, "openai")) {
-      key <- input$provider_key
-      if (!nzchar(key)) key <- Sys.getenv("OPENAI_API_KEY", unset = "")
-      return(openai_model_provider(openai_config(
-        api_key = key, base_url = input$model_base_url,
-        embed_model = input$embed_model, tagger_model = input$tag_model
-      )))
-    }
-    ollama_model_provider(ollama_config(
-      base_url = input$model_base_url,
-      embed_model = input$embed_model,
-      tagger_model = input$tag_model
-    ))
-  })
-  f_config <- shiny::reactive(fluree_config(
-    base_url = input$fluree_url, ledger = input$ledger,
-    ai_branch = input$ai_branch, trace_callback = event_callback
-  ))
-  shiny::observeEvent(input$model_provider, {
-    if (identical(input$model_provider, "openai")) {
-      shiny::updateTextInput(session, "model_base_url", value = "https://api.openai.com/v1")
-      shiny::updateTextInput(session, "embed_model", value = "text-embedding-3-small")
-      shiny::updateTextInput(session, "tag_model", value = "gpt-5.4-mini")
-    } else {
-      config <- ollama_config()
-      shiny::updateTextInput(session, "model_base_url", value = config$base_url)
-      shiny::updateTextInput(session, "embed_model", value = config$embed_model)
-      shiny::updateTextInput(session, "tag_model", value = config$tagger_model)
-    }
-  }, ignoreInit = TRUE)
-  update_run <- function(value) {
-    previous <- names((rv$run %||% list(proposals = list()))$proposals %||% list())
-    proposals <- names(value$proposals %||% list())
-    added <- setdiff(proposals, previous)
-    current <- shiny::isolate(input$review_cluster %||% "")
-    selected <- if (length(added)) utils::tail(added, 1L) else if (current %in% proposals) current else if (length(proposals)) utils::tail(proposals, 1L) else character()
-    rv$run <- value
-    shiny::updateSelectInput(session, "review_cluster", choices = proposals, selected = selected)
-    leaf_ids <- .walkthrough_leaf_ids(value)
-    current_leaf <- shiny::isolate(input$diagnostic_cluster %||% "")
-    selected_leaf <- if (current_leaf %in% leaf_ids) {
-      current_leaf
-    } else if (length(leaf_ids)) {
-      leaf_ids[[1]]
-    } else {
-      character()
-    }
-    shiny::updateSelectInput(
-      session, "diagnostic_cluster",
-      choices = leaf_ids, selected = selected_leaf
-    )
-    shiny::updateSelectInput(
-      session, "destination_cluster",
-      choices = setdiff(leaf_ids, selected_leaf)
-    )
-  }
+
   notify_error <- function(expr) {
-    tryCatch(expr, error = function(e) {
-      shiny::showNotification(conditionMessage(e), type = "error", duration = NULL)
+    tryCatch(expr, error = function(error) {
+      shiny::showNotification(
+        conditionMessage(error), type = "error", duration = NULL
+      )
       NULL
     })
   }
 
-  refresh_guidance <- function() {
-    result <- notify_error(fluree_list_tagging_guidance(
-      f_config(), branch = f_config()$main_branch
-    ))
-    if (!is.null(result)) rv$guidance <- result
-    invisible(result)
+  fluree_config <- shiny::reactive({
+    key <- trimws(input$fluree_key %||% "")
+    if (!nzchar(key)) key <- Sys.getenv("FLUREE_API_KEY", unset = "")
+    if (!nzchar(key)) key <- NULL
+    novaRush::setConfig(
+      baseUrl = trimws(input$fluree_url), ledger = trimws(input$ledger),
+      branch = trimws(input$branch), apiKey = key,
+      timeout = as.numeric(input$fluree_timeout)
+    )
+  })
+
+  openai_provider <- function() {
+    key <- trimws(input$openai_key %||% "")
+    if (!nzchar(key)) key <- Sys.getenv("OPENAI_API_KEY", unset = "")
+    config <- novaTagger::openai_config(
+      api_key = key,
+      base_url = trimws(input$openai_base_url),
+      embed_model = trimws(input$tag_embed_model),
+      generation_model = trimws(input$tag_model)
+    )
+    provider <- novaTagger::openai_model_provider(config)
+    if (!novaTagger::model_provider_validate(provider)) {
+      stop("OpenAI provider validation failed.", call. = FALSE)
+    }
+    provider
   }
 
-  selected_guidance <- shiny::reactive({
-    selected <- input$guidance_table_rows_selected
-    shiny::req(length(selected) == 1L, nrow(rv$guidance) >= selected)
-    .tagging_guidance_from_row(rv$guidance[selected, , drop = FALSE])
-  })
-
-  shiny::observeEvent(input$refresh_guidance, refresh_guidance())
-  shiny::observeEvent(input$create_guidance, {
-    tags <- trimws(strsplit(input$guidance_tags, ",", fixed = TRUE)[[1]])
-    severity <- input$guidance_severity
-    if (!identical(input$guidance_kind, "constraint") || !nzchar(severity)) {
-      severity <- NULL
-    }
-    guidance <- notify_error(new_tagging_guidance(
-      input$guidance_text,
-      kind = input$guidance_kind,
-      tags = tags,
-      rationale = input$guidance_candidate_rationale,
-      severity = severity
-    ))
-    if (is.null(guidance)) return()
-    saved <- notify_error({
-      fluree_upsert_tagging_guidance(
-        guidance, f_config(), branch = f_config()$main_branch
+  model_trace <- function(event) {
+    if (!identical(event$system, "openai")) return(invisible(NULL))
+    endpoint <- event$endpoint %||% ""
+    if (identical(event$direction, "request")) {
+      rv$model_message <- paste(
+        if (identical(endpoint, "/responses")) "Generating tag with" else
+          "Embedding tag with",
+        event$body$model
       )
-      TRUE
-    })
-    if (isTRUE(saved)) refresh_guidance()
-  })
-
-  review_guidance <- function(decision) {
-    guidance <- selected_guidance()
-    reviewed <- notify_error(review_tagging_guidance(
-      guidance,
-      decision,
-      reviewer_id = input$guidance_reviewer,
-      rationale = input$guidance_review_rationale,
-      expected_revision = guidance$revision
-    ))
-    if (is.null(reviewed)) return()
-    notify_error(fluree_upsert_tagging_guidance(
-      reviewed, f_config(), branch = f_config()$main_branch,
-      expected_revision = guidance$revision
-    ))
-    refresh_guidance()
+    } else if (identical(event$direction, "response")) {
+      usage <- event$body$usage %||% list()
+      tokens <- usage$total_tokens %||% usage$prompt_tokens %||% NA_integer_
+      rv$model_message <- paste0(
+        if (identical(endpoint, "/responses")) "Generation" else "Embedding",
+        " completed", if (!is.na(tokens)) paste0("; tokens: ", tokens) else ""
+      )
+    }
+    invisible(NULL)
   }
-  shiny::observeEvent(input$approve_guidance, review_guidance("approve"))
-  shiny::observeEvent(input$reject_guidance, review_guidance("reject"))
-  shiny::observeEvent(input$retire_guidance, review_guidance("retire"))
-  shiny::observeEvent(input$supersede_guidance, {
-    guidance <- selected_guidance()
-    result <- notify_error(supersede_tagging_guidance(
-      guidance,
-      replacement_text = input$guidance_replacement,
-      reviewer_id = input$guidance_reviewer,
-      rationale = input$guidance_review_rationale,
-      expected_revision = guidance$revision
-    ))
-    if (is.null(result)) return()
-    notify_error(fluree_upsert_tagging_guidance(
-      result, f_config(), branch = f_config()$main_branch,
-      expected_revision = guidance$revision
-    ))
-    refresh_guidance()
-  })
 
-  shiny::observeEvent(input$load_questions, {
+  reload_workflow <- function() {
+    if (is.null(rv$store)) stop("Resume a tagging run first.", call. = FALSE)
+    rv$workflow <- novaTagger::resume_tagging_workflow(rv$store)
+    rv$workflow
+  }
+
+  shiny::observeEvent(input$ledger, {
+    ledger <- trimws(input$ledger)
+    if (!nzchar(ledger)) return()
+    current <- trimws(input$survey_graph %||% "")
+    if (!nzchar(current) || grepl("/integration/.+/graph/survey$", current)) {
+      shiny::updateTextInput(
+        session, "survey_graph", value = .tagger_default_survey_graph(ledger)
+      )
+    }
+  }, ignoreInit = TRUE)
+
+  shiny::observeEvent(list(input$ledger, input$run_id), {
+    ledger <- trimws(input$ledger)
     run_id <- trimws(input$run_id)
-    if (!nzchar(run_id)) run_id <- .new_tag_run_id()
-    branch <- trimws(input$ai_branch)
-    if (!nzchar(branch)) branch <- fluree_ai_branch_name(run_id)
-    config <- f_config()
-    config$ai_branch <- branch
-    store <- notify_error(prepare_fluree_tag_store(config, run_id, branch))
-    if (is.null(store)) return()
-    if (tag_store_exists(store)) {
-      shiny::updateTextInput(session, "run_id", value = run_id)
-      shiny::updateTextInput(session, "ai_branch", value = branch)
-      shiny::showNotification(
-        paste0(
-          "Run '", run_id, "' already exists on branch '", branch,
-          "'. Click 'Resume Fluree run' to continue it, or choose a new run ID."
-        ),
-        type = "warning", duration = NULL
+    if (!nzchar(ledger) || !nzchar(run_id)) return()
+    current <- trimws(input$tagging_graph_base %||% "")
+    if (!nzchar(current) || grepl("/graph/tagging/openai/.+/$", current)) {
+      shiny::updateTextInput(
+        session, "tagging_graph_base",
+        value = .tagger_default_graph_base(ledger, run_id)
       )
-      return()
     }
-    result <- notify_error(new_tagger_walkthrough(
-      input$forms_path, limit_n = if (isTRUE(input$full_set)) Inf else input$limit_n,
-      store = store, run_id = run_id, event_callback = event_callback
-    ))
-    if (!is.null(result)) {
-      result$fluree_config <- config
-      shiny::updateTextInput(session, "run_id", value = run_id)
-      shiny::updateTextInput(session, "ai_branch", value = branch)
-      update_run(result)
-    }
-  })
-  shiny::observeEvent(input$resume_run, {
-    run_id <- trimws(input$run_id)
-    branch <- trimws(input$ai_branch)
-    if (!nzchar(run_id) || !nzchar(branch)) {
-      shiny::showNotification(
-        "Enter both the run ID and AI branch to resume.", type = "warning"
-      )
-      return()
-    }
-    config <- f_config()
-    config$ai_branch <- branch
-    store <- fluree_tag_store(config, run_id, branch)
-    result <- notify_error(load_tagger_walkthrough(store, config))
-    if (!is.null(result)) update_run(result)
-  })
-  shiny::observeEvent(input$embed, {
-    shiny::req(rv$run)
-    result <- notify_error(shiny::withProgress(message = "Embedding questions", value = 0, {
-      walkthrough_embed(
-        rv$run, provider_config(), batch_size = input$batch_size,
-        event_callback = event_callback,
-        progress_callback = function(done, total, label) {
-          shiny::setProgress(value = done / total, detail = label)
-        }
-      )
-    }))
-    if (!is.null(result)) update_run(result)
-  })
-  shiny::observeEvent(input$cluster, {
-    shiny::req(rv$run)
-    result <- notify_error(shiny::withProgress(message = "Running BERTopic", value = 0.1, {
-      out <- walkthrough_infer_bertopic(rv$run, event_callback = event_callback)
-      shiny::incProgress(0.9)
-      out
-    }))
-    if (!is.null(result)) update_run(result)
-  })
-  shiny::observeEvent(input$prepare_fluree, {
-    shiny::req(rv$run)
-    result <- notify_error(shiny::withProgress(message = "Loading questions into Fluree", value = 0, {
-      walkthrough_prepare_fluree(
-        rv$run, f_config(), ai_branch = if (nzchar(input$ai_branch)) input$ai_branch else NULL,
-        event_callback = event_callback, batch_size = input$fluree_batch_size,
-        progress_callback = function(done, total, label) {
-          shiny::setProgress(value = done / total, detail = label)
-        }
-      )
-    }))
-    if (!is.null(result)) update_run(result)
-  })
-  tag_once <- function(run, level = NULL) walkthrough_tag_next(
-    run, provider_config(), level = level, evidence_limit = input$evidence_limit,
-    precedent_limit = input$precedent_limit,
-    guidance_limit = input$guidance_limit,
-    sample_size = input$sample_size, event_callback = event_callback
-  )
-  shiny::observeEvent(input$tag_next, {
-    shiny::req(rv$run)
-    result <- notify_error(tag_once(rv$run))
-    if (!is.null(result)) update_run(result)
-  })
-  shiny::observeEvent(input$tag_level, {
-    shiny::req(rv$run, rv$run$state)
-    next_one <- walkthrough_next_cluster(rv$run)
-    if (!nrow(next_one)) return()
-    level <- next_one$level[[1]]
-    total <- sum(rv$run$state$clusters$level == level &
-      (is.na(rv$run$state$clusters$tag) | !nzchar(rv$run$state$clusters$tag) |
-         rv$run$state$clusters$tag == "untagged"))
-    result <- notify_error(shiny::withProgress(message = paste("Tagging level", level), value = 0, {
-      out <- rv$run
-      for (i in seq_len(total)) {
-        out <- tag_once(out, level)
-        shiny::incProgress(1 / total, detail = paste(i, "of", total))
+  }, ignoreInit = TRUE)
+
+  load_questions <- function() {
+    shiny::req(nzchar(trimws(input$ledger)), nzchar(trimws(input$survey_graph)))
+    result <- notify_error(shiny::withProgress(
+      message = "Reading survey knowledge from Fluree", value = 0.2,
+      {
+        questions <- novaTagger::query_taggable_questions(
+          fluree_config(), graph = trimws(input$survey_graph),
+          branch = trimws(input$branch),
+          page_size = as.integer(input$query_page_size)
+        )
+        shiny::setProgress(1, detail = paste(nrow(questions), "questions loaded"))
+        questions
       }
-      out
-    }))
-    if (!is.null(result)) update_run(result)
+    ))
+    if (is.null(result)) return(NULL)
+    rv$questions <- result
+    rv$workflow <- NULL
+    rv$store <- NULL
+    rv$connection_message <- paste0(
+      "Connected to ", trimws(input$ledger), ":", trimws(input$branch)
+    )
+    result
+  }
+
+  shiny::observeEvent(input$load_questions, load_questions())
+
+  shiny::observeEvent(input$resume_run, {
+    shiny::req(nzchar(trimws(input$run_id)),
+               nzchar(trimws(input$tagging_graph_base)))
+    questions <- rv$questions
+    if (is.null(questions)) questions <- load_questions()
+    if (is.null(questions)) return()
+    workflow <- notify_error(shiny::withProgress(
+      message = "Reconstructing tagging state from Fluree", value = 0.2,
+      {
+        repository <- novaTagger::novarush_semantic_repository(
+          fluree_config(), graphs = .tagger_graphs(input$tagging_graph_base),
+          branch = trimws(input$branch),
+          batch_size = as.integer(input$tag_batch_size)
+        )
+        store <- novaTagger::semantic_tag_store(
+          repository, questions, trimws(input$run_id),
+          base_iri = "https://data.nova.org/tagger/"
+        )
+        if (!novaTagger::tag_store_exists(store)) {
+          stop("The requested tagging run was not found in these named graphs.",
+               call. = FALSE)
+        }
+        rv$store <- store
+        result <- novaTagger::resume_tagging_workflow(store)
+        shiny::setProgress(1, detail = paste("Revision", result$state$revision))
+        result
+      }
+    ))
+    if (!is.null(workflow)) rv$workflow <- workflow
   })
 
-  review <- function(decision) {
-    shiny::req(rv$run, input$review_cluster)
-    parts <- strsplit(input$review_cluster, ":", fixed = TRUE)[[1]]
-    result <- notify_error(walkthrough_review_tag(
-      rv$run, parts[[1]], parts[[2]], decision,
-      tag = input$edited_tag, event_callback = event_callback,
-      provider = provider_config()
-    ))
-    if (!is.null(result)) update_run(result)
-  }
-  shiny::observeEvent(input$accept_tag, review("accepted"))
-  shiny::observeEvent(input$edit_tag, review("edited"))
-  shiny::observeEvent(input$reject_tag, review("rejected"))
-  shiny::observeEvent(input$refresh_similarity, {
-    shiny::req(rv$run, input$review_cluster)
-    parts <- strsplit(input$review_cluster, ":", fixed = TRUE)[[1]]
-    result <- notify_error(walkthrough_refresh_tag_embedding(
-      rv$run, parts[[1]], parts[[2]], provider_config(), event_callback
-    ))
-    if (!is.null(result)) update_run(result)
+  shiny::observe({
+    if (is.null(rv$workflow)) {
+      shiny::updateSelectInput(session, "proposal_id", choices = character())
+      return()
+    }
+    choices <- .proposal_choices(rv$workflow$state)
+    current <- shiny::isolate(input$proposal_id %||% "")
+    selected <- if (current %in% unname(choices)) {
+      current
+    } else if (length(choices)) {
+      utils::tail(unname(choices), 1L)
+    } else character()
+    shiny::updateSelectInput(
+      session, "proposal_id", choices = choices, selected = selected
+    )
   })
-  shiny::observeEvent(input$review_cluster, {
-    proposal <- rv$run$proposals[[input$review_cluster]] %||% NULL
+
+  shiny::observe({
+    if (is.null(rv$workflow) || is.null(rv$workflow$state$clusters)) {
+      shiny::updateSelectInput(session, "quality_cluster", choices = character())
+      return()
+    }
+    choices <- .cluster_choices(rv$workflow$state)
+    current <- shiny::isolate(input$quality_cluster %||% "")
+    selected <- if (current %in% unname(choices)) current else
+      if (length(choices)) unname(choices)[[1]] else character()
+    shiny::updateSelectInput(
+      session, "quality_cluster", choices = choices, selected = selected
+    )
+  })
+
+  shiny::observeEvent(input$hierarchy_node_selected, {
+    node <- as.character(input$hierarchy_node_selected %||% "")
+    matched <- regexec("^L([0-9]+)C(.+)$", node)
+    parts <- regmatches(node, matched)[[1]]
+    if (length(parts) == 3L) {
+      key <- paste(parts[[2]], parts[[3]], sep = ":")
+      choices <- .cluster_choices(rv$workflow$state)
+      if (key %in% unname(choices)) {
+        shiny::updateSelectInput(session, "quality_cluster", selected = key)
+      }
+    }
+  }, ignoreInit = TRUE)
+
+  shiny::observeEvent(input$proposal_id, {
+    if (is.null(rv$workflow)) return()
+    proposal <- .selected_proposal(rv$workflow$state, input$proposal_id)
     if (!is.null(proposal)) {
       shiny::updateTextInput(session, "edited_tag", value = proposal$tag)
-      if (is.null(proposal$tag_embedding)) {
-        parts <- strsplit(input$review_cluster, ":", fixed = TRUE)[[1]]
-        result <- notify_error(walkthrough_refresh_tag_embedding(
-          rv$run, parts[[1]], parts[[2]], provider_config(), event_callback
+    }
+  }, ignoreInit = TRUE)
+
+  shiny::observeEvent(input$generate_proposal, {
+    shiny::req(rv$store)
+    result <- notify_error(shiny::withProgress(
+      message = "Generating and persisting tag proposal", value = 0.1,
+      {
+        workflow <- reload_workflow()
+        next_cluster <- novaTagger::workflow_next_cluster(workflow)
+        if (!nrow(next_cluster)) {
+          stop("No cluster is currently available for a new proposal.",
+               call. = FALSE)
+        }
+        provider <- openai_provider()
+        shiny::setProgress(.35, detail = paste0(
+          "Level ", next_cluster$level[[1]],
+          ", cluster ", next_cluster$cluster_id[[1]]
         ))
-        if (!is.null(result)) update_run(result)
+        workflow <- novaTagger::workflow_propose_next(
+          workflow, provider,
+          sample_size = as.integer(input$tag_sample_size),
+          event_callback = model_trace
+        )
+        shiny::setProgress(.8, detail = "Reloading proposal from Fluree")
+        persisted <- novaTagger::resume_tagging_workflow(rv$store)
+        shiny::setProgress(1, detail = paste("Revision", persisted$state$revision))
+        persisted
       }
+    ))
+    if (!is.null(result)) {
+      rv$workflow <- result
+      shiny::showNotification(
+        "Proposal generated, embedded, persisted, and reloaded.", type = "message"
+      )
     }
   })
 
-  diagnostics <- shiny::reactive({
-    shiny::req(.walkthrough_has_hierarchy(rv$run))
-    diagnose_tagging_clusters(rv$run$state)
+  review_selected <- function(decision) {
+    shiny::req(rv$store, nzchar(input$proposal_id %||% ""))
+    result <- notify_error(shiny::withProgress(
+      message = paste("Applying reviewer decision:", decision), value = 0.15,
+      {
+        workflow <- reload_workflow()
+        proposal <- .selected_proposal(workflow$state, input$proposal_id)
+        if (is.null(proposal)) stop("The selected proposal no longer exists.", call. = FALSE)
+        if (!proposal$status %in% c("proposed", "deferred")) {
+          stop(
+            "Only proposed or deferred tags can be reviewed; current status is ",
+            proposal$status, ".", call. = FALSE
+          )
+        }
+        arguments <- list(
+          workflow = workflow, proposal_id = input$proposal_id,
+          decision = decision, reviewer_id = trimws(input$reviewer_id),
+          rationale = input$review_rationale
+        )
+        if (identical(decision, "edited")) {
+          arguments$tag <- trimws(input$edited_tag)
+          arguments$provider <- openai_provider()
+          arguments$event_callback <- model_trace
+        }
+        workflow <- do.call(novaTagger::workflow_review_proposal, arguments)
+        shiny::setProgress(.8, detail = "Reloading reviewer decision from Fluree")
+        persisted <- novaTagger::resume_tagging_workflow(rv$store)
+        shiny::setProgress(1, detail = paste("Revision", persisted$state$revision))
+        persisted
+      }
+    ))
+    if (!is.null(result)) {
+      rv$workflow <- result
+      shiny::showNotification(
+        paste("Reviewer decision persisted:", decision), type = "message"
+      )
+    }
+  }
+
+  shiny::observeEvent(input$accept_proposal, review_selected("accepted"))
+  shiny::observeEvent(input$edit_proposal, review_selected("edited"))
+  shiny::observeEvent(input$reject_proposal, review_selected("rejected"))
+  shiny::observeEvent(input$defer_proposal, review_selected("deferred"))
+
+  filtered_questions <- shiny::reactive({
+    if (is.null(rv$questions)) return(.empty_question_summary())
+    .question_summary(
+      rv$questions,
+      question_class = input$question_class_filter,
+      repeat_only = input$repeat_only,
+      search = input$question_search
+    )
   })
-  projection <- shiny::reactive({
-    shiny::req(.walkthrough_has_hierarchy(rv$run))
-    question_projection_2d(rv$run$state)
+
+  selected_question_id <- shiny::reactive({
+    selected <- input$question_table_rows_selected
+    data <- filtered_questions()
+    if (length(selected) != 1L || selected > nrow(data)) return(NULL)
+    data$id[[selected]]
   })
+
+  next_cluster_data <- shiny::reactive({
+    if (is.null(rv$workflow)) {
+      return(list(cluster = tibble::tibble(), questions = tibble::tibble()))
+    }
+    .next_cluster_summary(rv$workflow, as.integer(input$tag_sample_size))
+  })
+
+  selected_proposal <- shiny::reactive({
+    if (is.null(rv$workflow)) return(NULL)
+    .selected_proposal(rv$workflow$state, input$proposal_id)
+  })
+
+  selected_proposal_scores <- shiny::reactive({
+    proposal <- selected_proposal()
+    if (is.null(proposal)) return(tibble::tibble())
+    .proposal_question_scores(rv$workflow$state, proposal)
+  })
+
+  selected_quality_cluster <- shiny::reactive({
+    shiny::req(rv$workflow, nzchar(input$quality_cluster %||% ""))
+    cluster <- .parse_cluster_key(input$quality_cluster)
+    shiny::req(!is.null(cluster))
+    cluster
+  })
+
   selected_cluster_questions <- shiny::reactive({
-    shiny::req(input$diagnostic_cluster)
-    data <- diagnostics()$questions
-    data[data$current_cluster == input$diagnostic_cluster, , drop = FALSE] |>
-      dplyr::arrange(.data$current_centroid_similarity)
-  })
-  selected_diagnostic_ids <- shiny::reactive({
-    data <- selected_cluster_questions()
-    selected_rows <- input$diagnostic_questions_rows_selected
-    ids <- if (length(selected_rows)) data$question_id[selected_rows] else character()
-    clicked <- input$diagnostic_plot_click
-    if (!is.null(clicked)) {
-      plotted <- projection()
-      nearest <- shiny::nearPoints(
-        plotted, clicked, xvar = "x", yvar = "y", maxpoints = 1L
-      )
-      if (nrow(nearest) && nearest$cluster_id[[1]] == input$diagnostic_cluster) {
-        ids <- unique(c(ids, nearest$question_id[[1]]))
-      }
-    }
-    ids
+    cluster <- selected_quality_cluster()
+    .cluster_quality_questions(
+      rv$workflow$state, cluster$level, cluster$cluster_id
+    )
   })
 
-  shiny::observeEvent(input$diagnostic_cluster, {
-    shiny::req(.walkthrough_has_hierarchy(rv$run))
-    leaf_ids <- .walkthrough_leaf_ids(rv$run)
-    shiny::updateSelectInput(
-      session, "destination_cluster",
-      choices = setdiff(leaf_ids, input$diagnostic_cluster)
-    )
-    rv$structure_preview <- NULL
+  output$connection_status <- shiny::renderText(rv$connection_message)
+  output$run_status <- shiny::renderText({
+    if (is.null(rv$workflow)) return("No run resumed")
+    paste0(rv$workflow$state$run_id, "\nrevision ", rv$workflow$state$revision)
   })
-  shiny::observeEvent(input$preview_reclassification, {
-    shiny::req(rv$run$state, input$destination_cluster)
-    ids <- selected_diagnostic_ids()
-    if (!length(ids)) {
-      shiny::showNotification("Select at least one question.", type = "warning")
-      return()
-    }
-    rv$structure_preview <- notify_error(preview_question_reclassification(
-      rv$run$state, ids, input$destination_cluster
-    ))
+  output$stage_status <- shiny::renderText({
+    if (is.null(rv$workflow)) {
+      if (is.null(rv$questions)) "Waiting for questions" else "Questions ready"
+    } else rv$workflow$state$workflow$stage %||% "unknown"
   })
-  shiny::observeEvent(input$discard_reclassification, {
-    if (!is.null(rv$structure_preview)) {
-      discard_structure_change(rv$structure_preview)
-      rv$structure_preview <- NULL
-    }
-  })
-  shiny::observeEvent(input$apply_reclassification, {
-    shiny::req(rv$run$state, rv$structure_preview)
-    state <- notify_error(apply_structure_change(
-      rv$run$state,
-      rv$structure_preview,
-      reviewer_id = input$structure_reviewer,
-      rationale = input$structure_rationale
-    ))
-    if (is.null(state)) return()
-    if (!is.null(rv$run$fluree_config)) {
-      store <- fluree_tag_store(
-        rv$run$fluree_config,
-        run_id = state$run_id,
-        branch = rv$run$fluree_config$ai_branch
-      )
-      state <- notify_error(tag_store_save(store, state))
-      if (is.null(state)) return()
-    }
-    rv$run$state <- state
-    rv$run$proposals <- lapply(rv$run$proposals, function(proposal) {
-      domain <- state$proposals[[proposal$proposal_id %||% ""]] %||% NULL
-      domain %||% proposal
-    })
-    rv$run <- .walkthrough_checkpoint(rv$run)
-    rv$structure_preview <- NULL
-    update_run(rv$run)
-  })
-
-  output$stage <- shiny::renderText(if (is.null(rv$run)) "not started" else rv$run$stage)
-  output$run_identity <- shiny::renderText({
-    if (is.null(rv$run)) return("not started")
-    paste0(
-      rv$run$state$run_id, "\n",
-      rv$run$fluree_config$ai_branch %||% rv$run$store$metadata$branch %||% "",
-      "\nrevision ", rv$run$state$revision
-    )
-  })
-  output$question_count <- shiny::renderText(if (is.null(rv$run)) "0" else format(nrow(rv$run$questions), big.mark = ","))
-  output$tag_progress <- shiny::renderText({
-    if (!.walkthrough_has_clusters(rv$run)) return("0 / 0")
-    tags <- rv$run$state$clusters$tag
-    paste(sum(!is.na(tags) & nzchar(tags)), "/", length(tags))
-  })
-  output$hierarchy_summary <- shiny::renderText({
-    if (!.walkthrough_has_clusters(rv$run)) {
-      return("Run BERTopic to infer cluster counts.")
-    }
-    paste("Clusters from leaf to root:", paste(rv$run$state$clusters_by_level, collapse = " -> "))
-  })
-  output$hierarchy <- visNetwork::renderVisNetwork({
-    graph <- .walkthrough_graph_data(rv$run)
-    if (!nrow(graph$nodes)) return(visNetwork::visNetwork(data.frame(id = "empty", label = "Hierarchy not built"), data.frame()))
-    visNetwork::visNetwork(graph$nodes, graph$edges, width = "100%") |>
-      visNetwork::visGroups(groupname = "pending", color = list(background = "#d9d9d9")) |>
-      visNetwork::visGroups(groupname = "proposed", color = list(background = "#f4c95d")) |>
-      visNetwork::visGroups(groupname = "accepted", color = list(background = "#70c1b3")) |>
-      visNetwork::visGroups(groupname = "edited", color = list(background = "#70c1b3")) |>
-      visNetwork::visGroups(groupname = "rejected", color = list(background = "#ef767a")) |>
-      visNetwork::visHierarchicalLayout(direction = "DU", sortMethod = "directed") |>
-      visNetwork::visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE)
-  })
-  output$questions <- DT::renderDT({
-    if (is.null(rv$run)) return(DT::datatable(data.frame()))
-    DT::datatable(utils::head(rv$run$questions[, c("id", "caption"), drop = FALSE], 500),
-                  options = list(pageLength = 15), rownames = FALSE)
-  })
-  output$guidance_table <- DT::renderDT({
-    data <- rv$guidance
-    if (nrow(data)) {
-      data$tags <- vapply(
-        data$tags, paste, collapse = ", ", FUN.VALUE = character(1)
-      )
-    }
+  output$walkthrough_progress <- DT::renderDT({
     DT::datatable(
-      data,
-      selection = "single",
-      rownames = FALSE,
-      options = list(pageLength = 15, order = list(list(6, "asc")))
+      .tagger_progress_table(rv$workflow, rv$questions), rownames = FALSE,
+      options = list(dom = "t", ordering = FALSE)
     )
   })
-  output$guidance_detail <- shiny::renderText({
-    selected <- input$guidance_table_rows_selected
-    if (length(selected) != 1L || nrow(rv$guidance) < selected) {
-      return("Select one guidance record.")
-    }
-    row <- rv$guidance[selected, , drop = FALSE]
-    row$tags <- vapply(
-      row$tags, paste, collapse = ", ", FUN.VALUE = character(1)
-    )
-    jsonlite::toJSON(row, auto_unbox = TRUE, pretty = TRUE, null = "null")
-  })
-  output$guidance_usage <- DT::renderDT({
-    selected <- input$guidance_table_rows_selected
-    if (length(selected) != 1L || nrow(rv$guidance) < selected) {
-      return(DT::datatable(data.frame()))
-    }
-    data <- fluree_tagging_guidance_usage(
-      f_config(),
-      rv$guidance$guidance_id[[selected]],
-      branch = f_config()$ai_branch
-    )
+  output$question_counts <- DT::renderDT({
+    if (is.null(rv$questions)) return(DT::datatable(data.frame()))
     DT::datatable(
-      data, rownames = FALSE, options = list(pageLength = 10, dom = "tip")
+      .question_projection_counts(rv$questions), rownames = FALSE,
+      options = list(dom = "t", ordering = FALSE)
     )
   })
-  output$event_table <- DT::renderDT({
-    if (!length(rv$events)) return(DT::datatable(data.frame()))
-    rows <- lapply(seq_along(rv$events), function(i) {
-      e <- rv$events[[i]]
-      data.frame(index = i, time = e$time %||% "", system = e$system %||% "",
-                 direction = e$direction %||% "", operation = e$operation %||% e$endpoint %||% "",
-                 stage = e$stage %||% "", stringsAsFactors = FALSE)
-    })
-    DT::datatable(dplyr::bind_rows(rows), selection = "single", rownames = FALSE,
-                  options = list(pageLength = 20, order = list(list(0, "desc"))))
+  output$question_table <- DT::renderDT({
+    DT::datatable(
+      filtered_questions(), selection = "single", rownames = FALSE,
+      filter = "top", options = list(pageLength = 20, scrollX = TRUE)
+    )
   })
-  output$event_detail <- shiny::renderText({
-    selected <- input$event_table_rows_selected
-    if (!length(selected) || !length(rv$events)) return("Select an event above.")
-    jsonlite::toJSON(rv$events[[selected]], auto_unbox = TRUE, pretty = TRUE, null = "null")
+  output$option_table <- DT::renderDT({
+    id <- selected_question_id()
+    if (is.null(id) || is.null(rv$questions)) return(DT::datatable(data.frame()))
+    DT::datatable(
+      .question_options(rv$questions, id), rownames = FALSE,
+      options = list(pageLength = 15, dom = "tip")
+    )
+  })
+  output$question_record <- shiny::renderText({
+    id <- selected_question_id()
+    if (is.null(id) || is.null(rv$questions)) return("Select one question.")
+    jsonlite::toJSON(
+      .question_record(rv$questions, id), auto_unbox = TRUE,
+      pretty = TRUE, null = "null", dataframe = "rows", na = "null"
+    )
+  })
+  output$model_activity <- shiny::renderText(rv$model_message)
+  output$next_cluster <- DT::renderDT({
+    DT::datatable(
+      next_cluster_data()$cluster, rownames = FALSE,
+      options = list(dom = "t", ordering = FALSE)
+    )
+  })
+  output$next_cluster_questions <- DT::renderDT({
+    DT::datatable(
+      next_cluster_data()$questions, rownames = FALSE,
+      options = list(pageLength = 10, dom = "tip", scrollX = TRUE)
+    )
   })
   output$proposal_detail <- shiny::renderText({
-    if (is.null(rv$run) || !nzchar(input$review_cluster %||% "")) return("Select a proposal.")
-    proposal <- rv$run$proposals[[input$review_cluster]]
-    summary <- proposal[setdiff(names(proposal), c("tag_embedding", "evidence", "prompt", "raw_response"))]
-    summary$embedding_dimension <- length(proposal$tag_embedding %||% numeric())
-    jsonlite::toJSON(summary, auto_unbox = TRUE, pretty = TRUE, null = "null")
-  })
-  review_data <- shiny::reactive({
-    shiny::req(rv$run, input$review_cluster)
-    parts <- strsplit(input$review_cluster, ":", fixed = TRUE)[[1]]
-    walkthrough_cluster_review_data(rv$run, parts[[1]], parts[[2]])
-  })
-  output$review_similarity_summary <- shiny::renderText({
-    data <- review_data()
-    if (is.na(data$mean_similarity)) {
-      "No tag embedding is stored yet. Click 'Recompute tag distances'."
-    } else {
-      paste0("Mean question-to-tag similarity: ", format(round(data$mean_similarity, 3), nsmall = 3),
-             " across ", data$question_count, " questions.")
-    }
-  })
-  output$review_children <- DT::renderDT({
-    data <- review_data()$children
-    DT::datatable(data, rownames = FALSE, options = list(pageLength = 10, dom = "tip"))
-  })
-  proposal_precedents <- shiny::reactive({
-    shiny::req(rv$run, input$review_cluster)
-    proposal <- rv$run$proposals[[input$review_cluster]]
-    evidence <- proposal$evidence
-    if (!is.list(evidence) || is.data.frame(evidence)) {
-      return(.empty_tag_precedents())
-    }
-    evidence$precedents %||% .empty_tag_precedents()
-  })
-  output$review_positive_precedents <- DT::renderDT({
-    data <- proposal_precedents()
-    DT::datatable(
-      data[data$kind == "positive", , drop = FALSE],
-      rownames = FALSE,
-      options = list(pageLength = 8, dom = "tip")
+    proposal <- selected_proposal()
+    if (is.null(proposal)) return("Select or generate a proposal.")
+    jsonlite::toJSON(
+      .safe_proposal_detail(proposal), auto_unbox = TRUE,
+      pretty = TRUE, null = "null", na = "null"
     )
   })
-  output$review_negative_precedents <- DT::renderDT({
-    data <- proposal_precedents()
-    DT::datatable(
-      data[data$kind == "negative", , drop = FALSE],
-      rownames = FALSE,
-      options = list(pageLength = 8, dom = "tip")
+  output$proposal_similarity_summary <- DT::renderDT({
+    table <- .similarity_summary(selected_proposal_scores())
+    widget <- DT::datatable(
+      table, rownames = FALSE, options = list(dom = "t", ordering = FALSE)
     )
+    DT::formatRound(widget, "value", digits = 4)
   })
-  output$review_guidance <- DT::renderDT({
-    shiny::req(rv$run, input$review_cluster)
-    proposal <- rv$run$proposals[[input$review_cluster]]
-    evidence <- proposal$evidence
-    data <- if (is.list(evidence) && !is.data.frame(evidence)) {
-      evidence$guidance %||% .empty_tagging_guidance()
-    } else .empty_tagging_guidance()
-    if (nrow(data)) data$tags <- vapply(data$tags, paste, collapse = ", ", FUN.VALUE = character(1))
-    DT::datatable(
-      data, rownames = FALSE, options = list(pageLength = 8, dom = "tip")
+  output$proposal_review_history <- DT::renderDT({
+    proposal <- selected_proposal()
+    data <- if (is.null(proposal)) tibble::tibble() else
+      .proposal_review_events(rv$workflow$state, proposal$proposal_id)
+    widget <- DT::datatable(
+      data, rownames = FALSE, options = list(pageLength = 8, dom = "tip", scrollX = TRUE)
     )
+    numeric <- intersect(c("before_mean", "after_mean", "mean_change"), names(data))
+    if (length(numeric)) DT::formatRound(widget, numeric, digits = 4) else widget
   })
-  output$review_questions <- DT::renderDT({
-    data <- review_data()$questions
-    table <- DT::datatable(
+  output$proposal_questions <- DT::renderDT({
+    data <- selected_proposal_scores()
+    widget <- DT::datatable(
       data, rownames = FALSE, filter = "top",
-      options = list(pageLength = 25, order = list(list(3, "desc")))
+      options = list(pageLength = 20, scrollX = TRUE)
     )
-    DT::formatRound(table, c("cosine_similarity", "cosine_distance"), digits = 4)
+    numeric <- intersect(c("cosine_similarity", "cosine_distance"), names(data))
+    if (length(numeric)) DT::formatRound(widget, numeric, digits = 4) else widget
   })
-  output$diagnostic_plot <- shiny::renderPlot({
-    data <- projection()
-    selected <- data$cluster_id == input$diagnostic_cluster
+  output$proposal_table <- DT::renderDT({
+    data <- if (is.null(rv$workflow)) .empty_proposal_table() else
+      .proposal_table(rv$workflow$state)
+    widget <- DT::datatable(
+      data, rownames = FALSE, filter = "top",
+      options = list(pageLength = 10, scrollX = TRUE)
+    )
+    if ("confidence" %in% names(data)) {
+      DT::formatRound(widget, "confidence", digits = 3)
+    } else widget
+  })
+  output$hierarchy_summary <- shiny::renderText({
+    if (is.null(rv$workflow)) return("Resume a tagging run to inspect it.")
+    state <- rv$workflow$state
+    clusters <- state$clusters %||% data.frame()
+    paste0(
+      "Run: ", state$run_id, "\n",
+      "Revision: ", state$revision, "\n",
+      "Stage: ", state$workflow$stage %||% "unknown", "\n",
+      "Embedding model: ", state$workflow$embedding_model %||% "unknown", "\n",
+      "Clustering method: ", state$workflow$clustering_method %||% "unknown", "\n",
+      "Levels: ", paste(state$clusters_by_level %||% integer(), collapse = " -> "), "\n",
+      "Cluster records: ", nrow(clusters), "\n",
+      "Proposals: ", length(state$proposals %||% list()), "\n",
+      "Review decisions: ", length(state$review_events %||% list())
+    )
+  })
+  output$hierarchy <- visNetwork::renderVisNetwork({
+    graph <- .tagger_hierarchy_graph(rv$workflow)
+    if (!nrow(graph$nodes)) {
+      return(visNetwork::visNetwork(
+        data.frame(id = "empty", label = "Resume a clustered run"), data.frame()
+      ))
+    }
+    visNetwork::visNetwork(graph$nodes, graph$edges, width = "100%") |>
+      visNetwork::visGroups(
+        groupname = "pending", color = list(background = "#d9d9d9")
+      ) |>
+      visNetwork::visGroups(
+        groupname = "proposed", color = list(background = "#f4c95d")
+      ) |>
+      visNetwork::visGroups(
+        groupname = "deferred", color = list(background = "#8ecae6")
+      ) |>
+      visNetwork::visGroups(
+        groupname = "accepted", color = list(background = "#70c1b3")
+      ) |>
+      visNetwork::visGroups(
+        groupname = "edited", color = list(background = "#70c1b3")
+      ) |>
+      visNetwork::visGroups(
+        groupname = "rejected", color = list(background = "#ef767a")
+      ) |>
+      visNetwork::visHierarchicalLayout(direction = "DU", sortMethod = "directed") |>
+      visNetwork::visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) |>
+      visNetwork::visEvents(selectNode = paste0(
+        "function(properties) {",
+        "Shiny.setInputValue('hierarchy_node_selected', properties.nodes[0], ",
+        "{priority: 'event'});",
+        "}"
+      ))
+  })
+  output$cluster_quality_summary <- DT::renderDT({
+    cluster <- selected_quality_cluster()
+    data <- .cluster_quality_summary(
+      rv$workflow$state, cluster$level, cluster$cluster_id
+    )
+    widget <- DT::datatable(
+      data, rownames = FALSE, options = list(dom = "t", scrollX = TRUE)
+    )
+    numeric <- intersect(c(
+      "mean_centroid_similarity", "minimum_centroid_similarity",
+      "mean_tag_similarity", "minimum_tag_similarity"
+    ), names(data))
+    if (length(numeric)) DT::formatRound(widget, numeric, digits = 4) else widget
+  })
+  output$cluster_context <- DT::renderDT({
+    cluster <- selected_quality_cluster()
+    DT::datatable(
+      .cluster_hierarchy_context(
+        rv$workflow$state, cluster$level, cluster$cluster_id
+      ),
+      rownames = FALSE, options = list(pageLength = 10, dom = "tip", scrollX = TRUE)
+    )
+  })
+  output$cluster_quality_questions <- DT::renderDT({
+    data <- selected_cluster_questions()
+    widget <- DT::datatable(
+      data, rownames = FALSE, filter = "top",
+      options = list(pageLength = 20, scrollX = TRUE)
+    )
+    numeric <- intersect(c(
+      "centroid_similarity", "tag_similarity",
+      "best_alternative_similarity", "placement_margin"
+    ), names(data))
+    if (length(numeric)) DT::formatRound(widget, numeric, digits = 4) else widget
+  })
+  output$all_cluster_quality <- DT::renderDT({
+    data <- if (is.null(rv$workflow)) tibble::tibble() else
+      .cluster_node_quality(rv$workflow$state)
+    DT::datatable(
+      data, rownames = FALSE, filter = "top",
+      options = list(pageLength = 15, order = list(list(4, "desc")))
+    )
+  })
+  output$cluster_pca <- shiny::renderPlot({
+    cluster <- selected_quality_cluster()
+    data <- .cluster_pca_projection(
+      rv$workflow$state, cluster$level, cluster$cluster_id
+    )
     graphics::plot(
       data$x, data$y,
-      col = ifelse(selected, "#d1495b", "#c7c7c7"),
-      pch = ifelse(selected, 19, 16),
+      col = ifelse(data$selected, "#d1495b", "#c7c7c7"),
+      pch = ifelse(data$selected, 19, 16),
       xlab = "PCA dimension 1", ylab = "PCA dimension 2",
-      main = paste("Leaf cluster", input$diagnostic_cluster)
+      main = paste("Level", cluster$level, "cluster", cluster$cluster_id)
     )
   })
-  output$diagnostic_clusters <- DT::renderDT({
-    DT::datatable(
-      diagnostics()$clusters,
-      rownames = FALSE,
-      options = list(pageLength = 10, order = list(list(6, "desc")))
-    )
-  })
-  output$diagnostic_questions <- DT::renderDT({
-    table <- DT::datatable(
-      selected_cluster_questions(),
-      selection = "multiple",
-      rownames = FALSE,
-      options = list(pageLength = 20, order = list(list(3, "asc")))
-    )
-    DT::formatRound(
-      table,
-      c(
-        "current_centroid_similarity", "best_alternative_similarity",
-        "placement_margin", "neighbour_disagreement"
-      ),
-      digits = 4
-    )
-  })
-  output$diagnostic_placements <- DT::renderDT({
-    ids <- selected_diagnostic_ids()
-    if (!length(ids)) return(DT::datatable(data.frame()))
-    table <- DT::datatable(
-      rank_question_placements(rv$run$state, ids),
-      rownames = FALSE,
-      options = list(pageLength = 20)
-    )
-    DT::formatRound(table, c("centroid_similarity", "tag_similarity"), digits = 4)
-  })
-  output$reclassification_metrics <- DT::renderDT({
-    if (is.null(rv$structure_preview)) return(DT::datatable(data.frame()))
-    DT::datatable(
-      rv$structure_preview$metrics,
-      rownames = FALSE,
-      options = list(pageLength = 10, dom = "tip")
-    )
-  })
-  output$cost <- shiny::renderTable({
-    if (is.null(rv$run)) return(NULL)
-    if (!identical(input$model_provider, "openai")) {
-      return(data.frame(note = "No pricing estimate is configured for this provider."))
-    }
-    n_clusters <- if (is.null(rv$run$state)) max(1L, ceiling(nrow(rv$run$questions) / 10)) else nrow(rv$run$state$clusters)
-    estimate_openai_tagger_cost(nrow(rv$run$questions), n_clusters,
-                                calls_per_cluster = 1,
-                                tagger_input_per_1m = 0.75,
-                                tagger_output_per_1m = 4.50)
-  }, digits = 4)
 }
 
 #' Construct the survey tagging reviewer application
 #'
-#' @description Builds the staged Shiny application without launching it. The
-#' current server still contains compatibility calls from the combined
-#' prototype; these are tracked in `taggerUI/ISSUES.md`.
+#' Builds the Shiny application without launching it. The app reads normalized
+#' survey knowledge and resumable tagging state from Fluree through novaTagger
+#' and novaRush; browser reactive state is never authoritative.
 #'
 #' @return A Shiny app object.
 #' @export
 tagger_app <- function() {
-  required <- c("shiny", "visNetwork", "DT")
-  missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
-  if (length(missing)) {
-    stop(
-      "Install the suggested UI packages: ", paste(missing, collapse = ", "),
-      call. = FALSE
-    )
-  }
   shiny::shinyApp(ui = .walkthrough_app_ui(), server = .walkthrough_app_server)
 }
 
 #' Launch the Fluree tagging walkthrough
-#'
-#' @description Starts a local Shiny interface for loading forms, embedding with
-#' a configured model provider, inferring BERTopic hierarchy levels,
-#' loading/querying Fluree, tagging
-#' bottom-up, inspecting every request/response, and reviewing proposals.
 #'
 #' @param launch.browser Passed to [shiny::runApp()].
 #' @return A Shiny app object, invisibly when launched.
