@@ -1,4 +1,15 @@
+node_modules
 .Rproj.user
 .Rhistory
+.Rbuildignore
+*.json
+*.Rproj
+.DS_Store
+temp.js
 .RData
-.Ruserdata
+
+# Build artifacts
+*.tar.gz
+*.Rcheck/
+.positai
+.httr-oauth
