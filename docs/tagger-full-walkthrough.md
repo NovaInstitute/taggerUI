@@ -54,6 +54,28 @@ case, punctuation, and whitespace normalisation. A repeated caption is only a
 candidate for review; embedding-based semantic deduplication belongs to the
 hierarchy and cluster-review workflow.
 
+## 4. Generate and review tags
+
+The active workflow presents the next bottom-up cluster, representative and
+outlying questions, and one generated tag proposal. The reviewer can accept,
+modify, reject, or defer it. Proposal embeddings use the same dimension as the
+persisted question embeddings, so the page can immediately show each
+question's cosine similarity to the proposed label.
+
+After generation, the page remains fixed on the proposal's cluster and shows
+all of its questions ordered from weakest to strongest tag match. It advances
+to the next cluster only after the reviewer records a decision.
+
+Proposals and decisions are persisted through focused writes. The returned
+workflow remains active in the Shiny session, avoiding a complete Fluree reload
+after every action. Use **Reload from Fluree** when an explicit synchronization
+or recovery step is needed.
+
+Level progress bars show reviewed clusters against total clusters. A compact
+table lets reviewers inspect tag and status at each hierarchy level without
+running PCA or full quality diagnostics. Interactive taxonomy cleanup,
+reclassification, and structural editing remain a later workflow phase.
+
 The **Review** page lets a person accept, edit, reject, or defer every
    proposal. Meaningful decisions are persisted as immutable review events on
    the selected branch, alongside a convenient current-state projection. Selecting a
@@ -65,7 +87,7 @@ The **Review** page lets a person accept, edit, reject, or defer every
 The graph updates after every cluster. Grey nodes are pending, amber nodes are
 proposed, green nodes are accepted/edited, and red nodes are rejected.
 
-## 3. What happens during one tagging cycle
+## 5. What happens during one tagging cycle
 
 For the next pending bottom-up cluster, the controller:
 
@@ -89,7 +111,7 @@ because printing thousands of full vectors would make the audit log unusable.
 
 No API key or Authorization header is recorded.
 
-## 4. Equivalent step-by-step R code
+## 6. Equivalent step-by-step R code
 
 Use this version to pause and inspect objects directly in the console:
 
@@ -246,7 +268,7 @@ is not the authoritative project record.
 recommended for full runs. Set `isolate = FALSE` only when debugging Python
 interactively on a small sample.
 
-## 5. Agent and MCP boundary
+## 7. Agent and MCP boundary
 
 The UI is only a controller. The reusable operations are already separate:
 

@@ -84,11 +84,18 @@
   question_class <- if ("question_class" %in% names(state$questions)) {
     as.character(state$questions$question_class[rows])
   } else rep(NA_character_, length(rows))
+  source_form_id <- if ("source_form_id" %in% names(state$questions)) {
+    as.character(state$questions$source_form_id[rows])
+  } else rep(NA_character_, length(rows))
+  centroid_rank <- rank(-centroid_similarity, ties.method = "first", na.last = "keep")
   result <- tibble::tibble(
     question_id = as.character(state$questions$id[rows]),
     question = as.character(state$questions$caption[rows]),
     question_class = question_class,
+    source_form_id = source_form_id,
     centroid_similarity = centroid_similarity,
+    centroid_rank = as.integer(centroid_rank),
+    representative = !is.na(centroid_rank) & centroid_rank <= min(5L, length(rows)),
     tag_similarity = tag_similarity,
     best_alternative_cluster = best_alternative,
     best_alternative_similarity = best_similarity,
@@ -174,23 +181,66 @@
 
 .cluster_node_quality <- function(state) {
   if (is.null(state$clusters) || !nrow(state$clusters)) return(tibble::tibble())
-  dplyr::bind_rows(lapply(seq_len(nrow(state$clusters)), function(i) {
-    row <- state$clusters[i, , drop = FALSE]
-    summary <- .cluster_quality_summary(state, row$level[[1]], row$cluster_id[[1]])
-    tibble::tibble(
-      key = paste(row$level[[1]], row$cluster_id[[1]], sep = ":"),
-      level = as.integer(row$level[[1]]),
-      cluster_id = as.character(row$cluster_id[[1]]),
-      review_status = summary$review_status,
-      flagged = summary$flagged,
-      warning_count = summary$centroid_outliers + summary$outside_tag_scope +
-        summary$alternative_better
-    )
+  state <- novaTagger::validate_tag_state(state)
+  embeddings <- as.matrix(state$embeddings)
+  embedding_norm <- sqrt(rowSums(embeddings^2))
+  levels <- sort(unique(as.integer(state$clusters$level)))
+  dplyr::bind_rows(lapply(levels, function(level) {
+    column <- .quality_assignment_column(level)
+    assigned <- as.character(state$assignments[[column]])
+    cluster_ids <- unique(assigned[!is.na(assigned) & nzchar(assigned)])
+    centroids <- do.call(rbind, lapply(cluster_ids, function(cluster_id) {
+      colMeans(embeddings[assigned == cluster_id, , drop = FALSE])
+    }))
+    centroid_norm <- sqrt(rowSums(centroids^2))
+    similarities <- (embeddings %*% t(centroids)) /
+      outer(embedding_norm, centroid_norm)
+    similarities[!is.finite(similarities)] <- NA_real_
+    current_column <- match(assigned, cluster_ids)
+    current_similarity <- similarities[cbind(seq_len(nrow(embeddings)), current_column)]
+    alternatives <- similarities
+    alternatives[cbind(seq_len(nrow(embeddings)), current_column)] <- -Inf
+    if (length(cluster_ids) > 1L) {
+      best_alternative <- apply(alternatives, 1L, max, na.rm = TRUE)
+      best_alternative[!is.finite(best_alternative)] <- NA_real_
+    } else best_alternative <- rep(NA_real_, nrow(embeddings))
+
+    dplyr::bind_rows(lapply(cluster_ids, function(cluster_id) {
+      rows <- which(assigned == cluster_id)
+      proposal <- .quality_latest_proposal(state, level, cluster_id)
+      tag_similarity <- rep(NA_real_, length(rows))
+      if (!is.null(proposal) && !is.null(proposal$tag_embedding)) {
+        tag_similarity <- .quality_cosine(
+          embeddings[rows, , drop = FALSE], proposal$tag_embedding
+        )
+      }
+      centroid_outlier <- is.na(current_similarity[rows]) |
+        current_similarity[rows] < 0.5
+      outside_tag <- !is.na(tag_similarity) & tag_similarity < 0.5
+      alternative_better <- !is.na(best_alternative[rows]) &
+        best_alternative[rows] - current_similarity[rows] >= 0.1
+      row <- .quality_cluster_row(state, level, cluster_id)
+      tibble::tibble(
+        key = paste(level, cluster_id, sep = ":"), level = level,
+        cluster_id = cluster_id,
+        tag = if (is.null(proposal)) as.character(row$tag[[1]]) else proposal$tag,
+        review_status = if (is.null(proposal)) "pending" else proposal$status,
+        question_count = length(rows),
+        mean_centroid_similarity = mean(current_similarity[rows], na.rm = TRUE),
+        minimum_centroid_similarity = min(current_similarity[rows], na.rm = TRUE),
+        centroid_outliers = sum(centroid_outlier),
+        outside_tag_scope = sum(outside_tag),
+        alternative_better = sum(alternative_better),
+        flagged = any(centroid_outlier | outside_tag | alternative_better),
+        warning_count = sum(centroid_outlier) + sum(outside_tag) +
+          sum(alternative_better)
+      )
+    }))
   }))
 }
 
-.cluster_choices <- function(state) {
-  quality <- .cluster_node_quality(state)
+.cluster_choices <- function(state, quality = NULL) {
+  if (is.null(quality)) quality <- .cluster_node_quality(state)
   if (!nrow(quality)) return(stats::setNames(character(), character()))
   labels <- paste0(
     "L", quality$level, " / C", quality$cluster_id,
@@ -200,6 +250,37 @@
   stats::setNames(quality$key, labels)
 }
 
+.filter_cluster_quality_questions <- function(questions, concern = "all") {
+  if (!nrow(questions) || identical(concern, "all")) return(questions)
+  keep <- switch(
+    concern,
+    centroid_outlier = questions$centroid_outlier,
+    outside_tag_scope = questions$outside_tag_scope,
+    alternative_better = questions$alternative_better,
+    representative = questions$representative,
+    rep(TRUE, nrow(questions))
+  )
+  questions[!is.na(keep) & keep, , drop = FALSE]
+}
+
+.hierarchy_run_summary <- function(workflow) {
+  if (is.null(workflow)) return(tibble::tibble())
+  state <- workflow$state
+  clusters <- state$clusters %||% data.frame()
+  tibble::tibble(
+    item = c("Run", "Revision", "Stage", "Embedding model", "Clustering method",
+             "Hierarchy levels", "Cluster records", "Proposals", "Review decisions"),
+    value = as.character(c(
+      state$run_id, state$revision, state$workflow$stage %||% "unknown",
+      state$workflow$embedding_model %||% "unknown",
+      state$workflow$clustering_method %||% "unknown",
+      paste(state$clusters_by_level %||% integer(), collapse = " -> "),
+      nrow(clusters), length(state$proposals %||% list()),
+      length(state$review_events %||% list())
+    ))
+  )
+}
+
 .parse_cluster_key <- function(key) {
   parts <- strsplit(as.character(key), ":", fixed = TRUE)[[1]]
   if (length(parts) != 2L || is.na(suppressWarnings(as.integer(parts[[1]]))) ||
@@ -207,8 +288,8 @@
   list(level = as.integer(parts[[1]]), cluster_id = parts[[2]])
 }
 
-.cluster_pca_projection <- function(state, level, cluster_id) {
-  projection <- novaTagger::question_projection_2d(state)
+.cluster_pca_projection <- function(state, level, cluster_id, projection = NULL) {
+  if (is.null(projection)) projection <- novaTagger::question_projection_2d(state)
   column <- .quality_assignment_column(level)
   assigned <- as.character(state$assignments[[column]][
     match(projection$question_id, state$assignments$id)

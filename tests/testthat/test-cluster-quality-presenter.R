@@ -29,6 +29,7 @@ test_that("cluster quality keeps centroid and tag fit separate", {
   state <- quality_state_fixture()
   questions <- taggerUI:::.cluster_quality_questions(state, 1L, 1L)
   expect_true(all(c("centroid_similarity", "tag_similarity") %in% names(questions)))
+  expect_true(all(c("centroid_rank", "representative", "source_form_id") %in% names(questions)))
   expect_false(identical(questions$centroid_similarity, questions$tag_similarity))
   expect_equal(questions$question_id, c("q2", "q1"))
 
@@ -53,6 +54,24 @@ test_that("node metadata combines review status with quality flags", {
   expect_type(quality$flagged, "logical")
   choices <- taggerUI:::.cluster_choices(quality_state_fixture())
   expect_true("1:1" %in% unname(choices))
+  expect_true(all(c("question_count", "centroid_outliers", "alternative_better") %in%
+                    names(quality)))
+})
+
+test_that("question concern filters expose outliers and representatives", {
+  questions <- taggerUI:::.cluster_quality_questions(quality_state_fixture(), 1L, 1L)
+  representatives <- taggerUI:::.filter_cluster_quality_questions(
+    questions, "representative"
+  )
+  expect_true(nrow(representatives) > 0L)
+  expect_true(all(representatives$representative))
+  expect_equal(taggerUI:::.filter_cluster_quality_questions(questions, "all"), questions)
+})
+
+test_that("hierarchy run summary is presentation-ready", {
+  summary <- taggerUI:::.hierarchy_run_summary(list(state = quality_state_fixture()))
+  expect_equal(names(summary), c("item", "value"))
+  expect_true(all(c("Run", "Cluster records") %in% summary$item))
 })
 
 test_that("current cluster status uses proposal time rather than query order", {

@@ -19,19 +19,19 @@ test_that("graph defaults reproduce the integration named-graph layout", {
 test_that("review workflow controls are present in the UI", {
   html <- as.character(taggerUI:::.walkthrough_app_ui())
   expected <- c(
-    "generate_proposal", "proposal_id", "edited_tag", "reviewer_id",
+    "generate_proposal", "edited_tag", "reviewer_id",
     "accept_proposal", "edit_proposal", "reject_proposal", "defer_proposal"
   )
   expect_true(all(vapply(expected, grepl, logical(1), x = html, fixed = TRUE)))
 })
 
-test_that("linked hierarchy quality controls are present in the UI", {
+test_that("simple tagging progress controls are present in the UI", {
   html <- as.character(taggerUI:::.walkthrough_app_ui())
   expected <- c(
-    "quality_cluster", "cluster_pca", "cluster_quality_summary",
-    "cluster_context", "cluster_quality_questions", "all_cluster_quality"
+    "level_progress_bars", "level_progress", "inspect_level", "cluster_overview"
   )
   expect_true(all(vapply(expected, grepl, logical(1), x = html, fixed = TRUE)))
+  expect_false(grepl("cluster_pca", html, fixed = TRUE))
 })
 
 test_that("visNetwork groups use the installed groupname API", {

@@ -44,6 +44,35 @@ test_that("proposal similarities are reviewer-ready", {
   expect_true(summary$value[[2]] > .9)
 })
 
+test_that("incompatible historical tag vectors do not crash presentation", {
+  state <- review_state_fixture()
+  state$proposals[[1]]$tag_embedding <- 1:3
+  scores <- taggerUI:::.proposal_question_scores(state, state$proposals[[1]])
+  expect_true(all(is.na(scores$cosine_similarity)))
+  expect_match(scores$score_note[[1]], "3 dimensions", fixed = TRUE)
+})
+
+test_that("tagging progress summarises levels without cluster diagnostics", {
+  workflow <- list(state = review_state_fixture())
+  progress <- taggerUI:::.tagging_level_progress(workflow)
+  expect_equal(progress$clusters, 1L)
+  expect_equal(progress$awaiting_decision, 1L)
+  expect_equal(progress$progress_percent, 0)
+
+  overview <- taggerUI:::.tagging_cluster_overview(workflow, 1L)
+  expect_equal(overview$status, "proposed")
+  expect_equal(overview$question_count, 2L)
+})
+
+test_that("proposal cluster summary remains tied to the proposal", {
+  state <- review_state_fixture()
+  proposal <- state$proposals[[1]]
+  summary <- taggerUI:::.proposal_cluster_summary(list(state = state), proposal)
+  expect_equal(summary$cluster$cluster_id, proposal$cluster_id)
+  expect_equal(summary$cluster$proposed_tag, "fuel use")
+  expect_equal(summary$questions$question_id, c("q2", "q1"))
+})
+
 test_that("review history presents all decision types and edit improvement", {
   decisions <- c("accepted", "edited", "rejected", "deferred")
   for (decision in decisions) {

@@ -24,3 +24,21 @@ source form, and repeat-group membership. Extraction-quality checks highlight
 missing metadata, inconsistent answer-option semantics, and captions repeated
 across the corpus. Repeated captions are candidates for inspection, not an
 automatic declaration that two survey questions are semantically identical.
+
+The active tagging page intentionally uses a lightweight hierarchy-progress
+view rather than calculating PCA and full cluster diagnostics. It shows how
+many clusters at each level have been reviewed and lets reviewers inspect the
+generated tags and statuses at any level. Full hierarchy cleanup remains
+available for a later workflow phase.
+
+Tag proposals are checkpointed for resumability. The Shiny session uses the
+workflow returned by each focused proposal or review write instead of
+rehydrating all question embeddings and hierarchy records after every action.
+`Reload from Fluree` remains the explicit synchronization operation. Tag-label
+embeddings are requested at the same dimension as the resumed question
+embeddings.
+
+Before generation, the review page previews the next cluster. Once a proposal
+exists, that cluster remains the active context and all of its questions are
+shown weakest tag match first. The page advances only after the reviewer
+accepts, modifies, rejects, or defers the proposal.
