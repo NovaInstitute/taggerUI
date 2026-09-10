@@ -6,8 +6,13 @@ by `novaTagger`, optionally initiates imports through `novaGraphDB`, and uses
 
 Reactive state is never authoritative project state.
 
-The combined prototype walkthrough is now staged here so the interface can be
-reviewed and decomposed in its destination package. Construct it with
-`tagger_app()` or launch it with `run_fluree_tagger_app()`. Its server still
-uses compatibility calls that must be mapped onto the public APIs of the other
-three packages before the complete workflow is expected to run.
+Construct the application with `tagger_app()` or launch it with
+`run_fluree_tagger_app()`. The first page separates a lightweight Fluree
+connection check from loading survey questions and reconstructing a persisted
+tagging run. A resumed run is retained in the Shiny session; ordinary page
+navigation does not repeatedly hydrate all vectors and hierarchy records.
+
+Changing the ledger, branch, run, or graph locations invalidates the hydrated
+session state. `Reload from Fluree` is the explicit recovery operation. The
+page warns when reviewers select `main` and identifies non-main review branches
+as isolated.

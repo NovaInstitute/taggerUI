@@ -10,7 +10,7 @@ tagger_app()
 A Shiny app object.
 }
 \description{
-Builds the staged Shiny application without launching it. The
-current server still contains compatibility calls from the combined
-prototype; these are tracked in \code{taggerUI/ISSUES.md}.
+Builds the Shiny application without launching it. The app reads normalized
+survey knowledge and resumable tagging state from Fluree through novaTagger
+and novaRush; browser reactive state is never authoritative.
 }

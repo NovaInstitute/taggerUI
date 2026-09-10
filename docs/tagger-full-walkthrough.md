@@ -1,34 +1,21 @@
 # Full Fluree and model-provider tagging walkthrough
 
-> Migration draft: this preserves the reviewer journey and expected screens.
-> The staged server still has legacy compatibility calls listed in
-> `taggerUI/ISSUES.md`, so the document is not yet an executable tutorial.
-
-This workflow processes the complete `forms.Rda` question set in explicit,
-checkpointed stages. A configured model provider creates embeddings and tag
-proposals, BERTopic infers the number of leaf topics, and Fluree stores
-questions, performs semantic retrieval, and keeps proposals on a separate AI
-branch.
+This interface reviews questions, embeddings, BERTopic hierarchies, proposals,
+and decisions that have already been persisted in Fluree. Initial form
+ingestion and taxonomy construction are handled outside `taggerUI`.
 
 ## 1. Prerequisites
 
 - Fluree is reachable at `http://localhost:8090`.
-- `~/Downloads/forms.Rda` contains the `forms` object.
-- OpenAI credentials are available, or Ollama is reachable for inexpensive
-  local testing.
-- The BERTopic Python environment is available through `reticulate`.
+- The target ledger contains a survey graph and a novaTagger run.
+- OpenAI credentials are available when generating or editing tags.
 
 From the package directory:
 
 ```r
 devtools::load_all("taggerUI")
 
-check_bertopic_environment()
-fluree_health_check(fluree_config())
 ```
-
-If BERTopic dependencies are missing, install them once with
-`install_bertopic_environment()`, restart R, and run the readiness check again.
 
 ## 2. Launch the visual walkthrough
 
@@ -37,34 +24,20 @@ devtools::load_all("taggerUI")
 run_fluree_tagger_app()
 ```
 
-The interface defaults to `~/Downloads/forms.Rda`, the local Fluree endpoint,
-and OpenAI. Select Ollama to use a local test provider. Provider URL,
-credentials, and model IDs remain editable so a run can be pinned to a
-particular provider configuration and model snapshot.
+On **Connect & resume**:
 
-Work through the numbered buttons:
+1. Enter the Fluree URL, ledger, and branch and select **Connect to Fluree**.
+   This is a lightweight health and ledger check.
+2. Enter the survey graph and tagging run ID. Their graph locations are derived
+   and displayed before any data is loaded.
+3. Select **Resume tagging run**. The application loads questions and
+   reconstructs the persisted run once, reports elapsed time, and retains it in
+   the Shiny session.
+4. Use **Reload from Fluree** only when an explicit cold refresh is required.
 
-1. **Load questions** flattens and deduplicates the full forms data.
-2. **Embed questions** sends captions through the selected provider in batches.
-   Each completed batch is stored once as Fluree question/vector entities on
-   `main`; the AI branch receives only lightweight workflow checkpoints.
-   Resume reloads completed vectors from Fluree by question ID and embedding
-   model, without copying the vector matrix into every run revision.
-3. **Infer hierarchy with BERTopic** discovers leaf topics and derives the
-   broader levels automatically. The resulting sequence is shown above the
-   graph. BERTopic runs in a clean child R/Python process with single-worker
-   UMAP and HDBSCAN settings. A native Python failure therefore produces a
-   worker-log error without terminating Shiny or damaging the embedding
-   checkpoint.
-4. **Publish vectors for evidence** verifies that vectors written during
-   embedding are available on `main` and marks the run ready for retrieval.
-   Runs created with a non-Fluree store still perform the full idempotent vector
-   upsert at this step. Tag proposals never write to `main`.
-5. **Tag next cluster** performs one fully inspectable cycle. **Tag current
-   level** repeats that cycle for every pending cluster in the current level.
-6. The **Review** tab lets a person accept, edit, reject, or defer every
+The **Review** page lets a person accept, edit, reject, or defer every
    proposal. Meaningful decisions are persisted as immutable review events on
-   the AI branch, alongside a convenient current-state projection. Selecting a
+   the selected branch, alongside a convenient current-state projection. Selecting a
    proposal shows every question in the cluster, its child tags, and the cosine
    similarity/distance between each question embedding and the proposed-tag
    embedding. Questions are ordered farthest-first to make weakly represented

@@ -117,54 +117,7 @@
     "Survey tagger walkthrough",
     shiny::tabPanel(
       "1. Connect & resume",
-      shiny::sidebarLayout(
-        shiny::sidebarPanel(
-          shiny::textInput("fluree_url", "Fluree URL", "http://localhost:8090"),
-          shiny::textInput("ledger", "Ledger", ""),
-          shiny::textInput("branch", "Branch", "main"),
-          shiny::passwordInput(
-            "fluree_key", "Fluree API key",
-            placeholder = "Uses FLUREE_API_KEY when blank"
-          ),
-          shiny::numericInput("fluree_timeout", "Request timeout (seconds)", 300,
-                              min = 10, max = 3600),
-          shiny::hr(),
-          shiny::textInput("survey_graph", "Survey named graph", ""),
-          shiny::numericInput("query_page_size", "Query page size", 200,
-                              min = 1, max = 2000),
-          shiny::actionButton(
-            "load_questions", "Load stored questions", class = "btn-primary"
-          ),
-          shiny::hr(),
-          shiny::textInput("run_id", "Tagging run ID", ""),
-          shiny::textInput("tagging_graph_base", "Tagging graph base", ""),
-          shiny::numericInput("tag_batch_size", "Persistence batch size", 50,
-                              min = 1, max = 500),
-          shiny::actionButton("resume_run", "Resume tagging run")
-        ),
-        shiny::mainPanel(
-          shiny::fluidRow(
-            shiny::column(4, shiny::wellPanel(
-              shiny::h4("Connection"), shiny::textOutput("connection_status")
-            )),
-            shiny::column(4, shiny::wellPanel(
-              shiny::h4("Run"), shiny::textOutput("run_status")
-            )),
-            shiny::column(4, shiny::wellPanel(
-              shiny::h4("Current stage"), shiny::textOutput("stage_status")
-            ))
-          ),
-          shiny::h3("Tagging walkthrough"),
-          shiny::p(
-            "The application reads authoritative survey and tagging state from ",
-            "Fluree. Loading questions does not modify the ledger. Resuming a ",
-            "run reconstructs its latest persisted revision."
-          ),
-          DT::DTOutput("walkthrough_progress"),
-          shiny::h4("Stored survey summary"),
-          DT::DTOutput("question_counts")
-        )
-      )
+      .connect_resume_ui("connect_resume")
     ),
     shiny::tabPanel(
       "2. Inspect questions",
@@ -289,8 +242,11 @@
   rv <- shiny::reactiveValues(
     questions = NULL, workflow = NULL, store = NULL,
     connection_message = "Not connected",
-    model_message = "No model request in this session"
+    model_message = "No model request in this session",
+    connected = FALSE, load_message = "No data loaded in this session"
   )
+
+  .connect_resume_server("connect_resume", rv)
 
   notify_error <- function(expr) {
     tryCatch(expr, error = function(error) {
@@ -300,17 +256,6 @@
       NULL
     })
   }
-
-  fluree_config <- shiny::reactive({
-    key <- trimws(input$fluree_key %||% "")
-    if (!nzchar(key)) key <- Sys.getenv("FLUREE_API_KEY", unset = "")
-    if (!nzchar(key)) key <- NULL
-    novaRush::setConfig(
-      baseUrl = trimws(input$fluree_url), ledger = trimws(input$ledger),
-      branch = trimws(input$branch), apiKey = key,
-      timeout = as.numeric(input$fluree_timeout)
-    )
-  })
 
   openai_provider <- function() {
     key <- trimws(input$openai_key %||% "")
@@ -353,87 +298,6 @@
     rv$workflow <- novaTagger::resume_tagging_workflow(rv$store)
     rv$workflow
   }
-
-  shiny::observeEvent(input$ledger, {
-    ledger <- trimws(input$ledger)
-    if (!nzchar(ledger)) return()
-    current <- trimws(input$survey_graph %||% "")
-    if (!nzchar(current) || grepl("/integration/.+/graph/survey$", current)) {
-      shiny::updateTextInput(
-        session, "survey_graph", value = .tagger_default_survey_graph(ledger)
-      )
-    }
-  }, ignoreInit = TRUE)
-
-  shiny::observeEvent(list(input$ledger, input$run_id), {
-    ledger <- trimws(input$ledger)
-    run_id <- trimws(input$run_id)
-    if (!nzchar(ledger) || !nzchar(run_id)) return()
-    current <- trimws(input$tagging_graph_base %||% "")
-    if (!nzchar(current) || grepl("/graph/tagging/openai/.+/$", current)) {
-      shiny::updateTextInput(
-        session, "tagging_graph_base",
-        value = .tagger_default_graph_base(ledger, run_id)
-      )
-    }
-  }, ignoreInit = TRUE)
-
-  load_questions <- function() {
-    shiny::req(nzchar(trimws(input$ledger)), nzchar(trimws(input$survey_graph)))
-    result <- notify_error(shiny::withProgress(
-      message = "Reading survey knowledge from Fluree", value = 0.2,
-      {
-        questions <- novaTagger::query_taggable_questions(
-          fluree_config(), graph = trimws(input$survey_graph),
-          branch = trimws(input$branch),
-          page_size = as.integer(input$query_page_size)
-        )
-        shiny::setProgress(1, detail = paste(nrow(questions), "questions loaded"))
-        questions
-      }
-    ))
-    if (is.null(result)) return(NULL)
-    rv$questions <- result
-    rv$workflow <- NULL
-    rv$store <- NULL
-    rv$connection_message <- paste0(
-      "Connected to ", trimws(input$ledger), ":", trimws(input$branch)
-    )
-    result
-  }
-
-  shiny::observeEvent(input$load_questions, load_questions())
-
-  shiny::observeEvent(input$resume_run, {
-    shiny::req(nzchar(trimws(input$run_id)),
-               nzchar(trimws(input$tagging_graph_base)))
-    questions <- rv$questions
-    if (is.null(questions)) questions <- load_questions()
-    if (is.null(questions)) return()
-    workflow <- notify_error(shiny::withProgress(
-      message = "Reconstructing tagging state from Fluree", value = 0.2,
-      {
-        repository <- novaTagger::novarush_semantic_repository(
-          fluree_config(), graphs = .tagger_graphs(input$tagging_graph_base),
-          branch = trimws(input$branch),
-          batch_size = as.integer(input$tag_batch_size)
-        )
-        store <- novaTagger::semantic_tag_store(
-          repository, questions, trimws(input$run_id),
-          base_iri = "https://data.nova.org/tagger/"
-        )
-        if (!novaTagger::tag_store_exists(store)) {
-          stop("The requested tagging run was not found in these named graphs.",
-               call. = FALSE)
-        }
-        rv$store <- store
-        result <- novaTagger::resume_tagging_workflow(store)
-        shiny::setProgress(1, detail = paste("Revision", result$state$revision))
-        result
-      }
-    ))
-    if (!is.null(workflow)) rv$workflow <- workflow
-  })
 
   shiny::observe({
     if (is.null(rv$workflow)) {
@@ -615,29 +479,6 @@
     )
   })
 
-  output$connection_status <- shiny::renderText(rv$connection_message)
-  output$run_status <- shiny::renderText({
-    if (is.null(rv$workflow)) return("No run resumed")
-    paste0(rv$workflow$state$run_id, "\nrevision ", rv$workflow$state$revision)
-  })
-  output$stage_status <- shiny::renderText({
-    if (is.null(rv$workflow)) {
-      if (is.null(rv$questions)) "Waiting for questions" else "Questions ready"
-    } else rv$workflow$state$workflow$stage %||% "unknown"
-  })
-  output$walkthrough_progress <- DT::renderDT({
-    DT::datatable(
-      .tagger_progress_table(rv$workflow, rv$questions), rownames = FALSE,
-      options = list(dom = "t", ordering = FALSE)
-    )
-  })
-  output$question_counts <- DT::renderDT({
-    if (is.null(rv$questions)) return(DT::datatable(data.frame()))
-    DT::datatable(
-      .question_projection_counts(rv$questions), rownames = FALSE,
-      options = list(dom = "t", ordering = FALSE)
-    )
-  })
   output$question_table <- DT::renderDT({
     DT::datatable(
       filtered_questions(), selection = "single", rownames = FALSE,
