@@ -35,6 +35,25 @@ On **Connect & resume**:
    the Shiny session.
 4. Use **Reload from Fluree** only when an explicit cold refresh is required.
 
+## 3. Inspect the stored question projection
+
+Open **Inspect questions** after loading or resuming a run. The summary cards
+show the corpus size, open and closed question counts, nested answer options,
+repeat-group questions, and source forms. Filters allow a reviewer to inspect a
+particular ontology question type or source form and search captions, source
+field names, answer-option labels, and form identifiers.
+
+Selecting a question shows its response semantics, source provenance,
+repeat-group membership, and nested answer options. The raw projection remains
+available under an expandable advanced section. This page never writes to
+Fluree.
+
+Quality warnings identify missing captions or source forms, closed questions
+without options, open questions carrying options, and captions repeated after
+case, punctuation, and whitespace normalisation. A repeated caption is only a
+candidate for review; embedding-based semantic deduplication belongs to the
+hierarchy and cluster-review workflow.
+
 The **Review** page lets a person accept, edit, reject, or defer every
    proposal. Meaningful decisions are persisted as immutable review events on
    the selected branch, alongside a convenient current-state projection. Selecting a

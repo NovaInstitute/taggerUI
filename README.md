@@ -16,3 +16,11 @@ Changing the ledger, branch, run, or graph locations invalidates the hydrated
 session state. `Reload from Fluree` is the explicit recovery operation. The
 page warns when reviewers select `main` and identifies non-main review branches
 as isolated.
+
+The **Inspect questions** page is a read-only view of the novaTagger question
+projection loaded from Fluree. It separates open and closed questions, displays
+nested answer options and survey provenance, and filters by ontology type,
+source form, and repeat-group membership. Extraction-quality checks highlight
+missing metadata, inconsistent answer-option semantics, and captions repeated
+across the corpus. Repeated captions are candidates for inspection, not an
+automatic declaration that two survey questions are semantically identical.

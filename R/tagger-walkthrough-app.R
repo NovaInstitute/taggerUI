@@ -121,31 +121,7 @@
     ),
     shiny::tabPanel(
       "2. Inspect questions",
-      shiny::fluidRow(
-        shiny::column(
-          3,
-          shiny::selectInput(
-            "question_class_filter", "Question class",
-            choices = c("All" = "all", "Open" = "open", "Closed" = "closed")
-          ),
-          shiny::checkboxInput("repeat_only", "Only questions in repeat groups"),
-          shiny::textInput("question_search", "Search caption, field, or option"),
-          shiny::p(
-            "Select a row to inspect its nested answer options and complete ",
-            "novaTagger projection."
-          )
-        ),
-        shiny::column(9, DT::DTOutput("question_table"))
-      ),
-      shiny::fluidRow(
-        shiny::column(
-          6, shiny::h4("Nested answer options"), DT::DTOutput("option_table")
-        ),
-        shiny::column(
-          6, shiny::h4("Selected question record"),
-          shiny::verbatimTextOutput("question_record")
-        )
-      )
+      .question_inspector_ui("question_inspector")
     ),
     shiny::tabPanel(
       "3. Hierarchy & quality",
@@ -247,6 +223,7 @@
   )
 
   .connect_resume_server("connect_resume", rv)
+  .question_inspector_server("question_inspector", rv)
 
   notify_error <- function(expr) {
     tryCatch(expr, error = function(error) {
@@ -430,23 +407,6 @@
   shiny::observeEvent(input$reject_proposal, review_selected("rejected"))
   shiny::observeEvent(input$defer_proposal, review_selected("deferred"))
 
-  filtered_questions <- shiny::reactive({
-    if (is.null(rv$questions)) return(.empty_question_summary())
-    .question_summary(
-      rv$questions,
-      question_class = input$question_class_filter,
-      repeat_only = input$repeat_only,
-      search = input$question_search
-    )
-  })
-
-  selected_question_id <- shiny::reactive({
-    selected <- input$question_table_rows_selected
-    data <- filtered_questions()
-    if (length(selected) != 1L || selected > nrow(data)) return(NULL)
-    data$id[[selected]]
-  })
-
   next_cluster_data <- shiny::reactive({
     if (is.null(rv$workflow)) {
       return(list(cluster = tibble::tibble(), questions = tibble::tibble()))
@@ -479,28 +439,6 @@
     )
   })
 
-  output$question_table <- DT::renderDT({
-    DT::datatable(
-      filtered_questions(), selection = "single", rownames = FALSE,
-      filter = "top", options = list(pageLength = 20, scrollX = TRUE)
-    )
-  })
-  output$option_table <- DT::renderDT({
-    id <- selected_question_id()
-    if (is.null(id) || is.null(rv$questions)) return(DT::datatable(data.frame()))
-    DT::datatable(
-      .question_options(rv$questions, id), rownames = FALSE,
-      options = list(pageLength = 15, dom = "tip")
-    )
-  })
-  output$question_record <- shiny::renderText({
-    id <- selected_question_id()
-    if (is.null(id) || is.null(rv$questions)) return("Select one question.")
-    jsonlite::toJSON(
-      .question_record(rv$questions, id), auto_unbox = TRUE,
-      pretty = TRUE, null = "null", dataframe = "rows", na = "null"
-    )
-  })
   output$model_activity <- shiny::renderText(rv$model_message)
   output$next_cluster <- DT::renderDT({
     DT::datatable(

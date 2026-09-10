@@ -61,5 +61,46 @@ test_that("question search includes captions, fields, and nested options", {
 
 test_that("projection counts expose question and option semantics", {
   counts <- taggerUI:::.question_projection_counts(question_fixture())
-  expect_equal(counts$value, c(2L, 1L, 1L, 2L, 1L))
+  expect_equal(counts$value, c(2L, 1L, 1L, 2L, 1L, 1L))
+})
+
+test_that("question summary filters ontology type, form, and repeat membership", {
+  questions <- question_fixture()
+  expect_equal(taggerUI:::.question_summary(
+    questions, question_type = "ClosedQuestion"
+  )$id, "q2")
+  expect_equal(taggerUI:::.question_summary(
+    questions, source_form = "form"
+  )$id, c("q1", "q2"))
+  expect_equal(taggerUI:::.question_summary(
+    questions, repeat_membership = "not_repeat"
+  )$id, "q1")
+})
+
+test_that("normalised caption duplicates and extraction warnings are visible", {
+  questions <- question_fixture()
+  questions <- dplyr::bind_rows(questions, questions[1, ])
+  questions$id[[3]] <- "q3"
+  questions$caption[[3]] <- "  Describe your home! "
+  duplicate <- taggerUI:::.question_summary(
+    questions, duplicate_filter = "duplicates"
+  )
+  expect_equal(duplicate$id, c("q1", "q3"))
+  expect_true(all(duplicate$potential_duplicate))
+  expect_true(all(grepl("repeated caption", duplicate$quality_issues, fixed = TRUE)))
+
+  questions$answer_count[[1]] <- 1L
+  warning <- taggerUI:::.question_summary(
+    questions, warning_filter = "warnings"
+  )
+  expect_true("q1" %in% warning$id)
+  expect_match(warning$quality_issues[warning$id == "q1"], "open question with options")
+})
+
+test_that("quality summary identifies malformed question semantics", {
+  questions <- question_fixture()
+  questions$answer_count <- c(1L, 0L)
+  quality <- taggerUI:::.question_quality_summary(questions)
+  expect_equal(quality$question_count[quality$check == "open questions with options"], 1L)
+  expect_equal(quality$question_count[quality$check == "closed questions without options"], 1L)
 })
