@@ -116,16 +116,21 @@
 .walkthrough_app_ui <- function() {
   shiny::navbarPage(
     "Survey tagger walkthrough",
+    id = "walkthrough_page",
     shiny::tabPanel(
-      "1. Connect & resume",
+      "1. Review workspace",
       .connect_resume_ui("connect_resume")
     ),
     shiny::tabPanel(
-      "2. Inspect questions",
+      "2. Review dashboard",
+      .review_dashboard_ui("review_dashboard")
+    ),
+    shiny::tabPanel(
+      "3. Inspect questions",
       .question_inspector_ui("question_inspector")
     ),
     shiny::tabPanel(
-      "3. Generate & review tags",
+      "4. Generate & review tags",
       .review_next_cluster_ui("review_next")
     )
   )
@@ -140,6 +145,7 @@
   )
 
   .connect_resume_server("connect_resume", rv)
+  .review_dashboard_server("review_dashboard", rv)
   .question_inspector_server("question_inspector", rv)
   .review_next_cluster_server("review_next", rv)
 }

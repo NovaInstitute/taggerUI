@@ -4,6 +4,15 @@ test_that("walkthrough UI constructs", {
   expect_true(is.function(app$serverFuncSource()))
 })
 
+test_that("walkthrough arranges the reviewer pages in workflow order", {
+  html <- as.character(taggerUI:::.walkthrough_app_ui())
+  expected <- c(
+    "1. Review workspace", "2. Review dashboard", "3. Inspect questions",
+    "4. Generate &amp; review tags"
+  )
+  expect_true(all(vapply(expected, grepl, logical(1), x = html, fixed = TRUE)))
+})
+
 test_that("graph defaults reproduce the integration named-graph layout", {
   base <- taggerUI:::.tagger_default_graph_base("demo-ledger", "demo-run")
   expect_equal(
