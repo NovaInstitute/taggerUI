@@ -126,11 +126,15 @@
       .review_dashboard_ui("review_dashboard")
     ),
     shiny::tabPanel(
-      "3. Inspect questions",
+      "3. Review hierarchy",
+      .hierarchy_review_ui("hierarchy_review")
+    ),
+    shiny::tabPanel(
+      "4. Inspect questions",
       .question_inspector_ui("question_inspector")
     ),
     shiny::tabPanel(
-      "4. Generate & review tags",
+      "5. Generate & review tags",
       .review_next_cluster_ui("review_next")
     )
   )
@@ -146,6 +150,7 @@
 
   .connect_resume_server("connect_resume", rv)
   .review_dashboard_server("review_dashboard", rv)
+  .hierarchy_review_server("hierarchy_review", rv)
   .question_inspector_server("question_inspector", rv)
   .review_next_cluster_server("review_next", rv)
 }

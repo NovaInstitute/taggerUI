@@ -7,8 +7,8 @@ test_that("walkthrough UI constructs", {
 test_that("walkthrough arranges the reviewer pages in workflow order", {
   html <- as.character(taggerUI:::.walkthrough_app_ui())
   expected <- c(
-    "1. Review workspace", "2. Review dashboard", "3. Inspect questions",
-    "4. Generate &amp; review tags"
+    "1. Review workspace", "2. Review dashboard", "3. Review hierarchy",
+    "4. Inspect questions", "5. Generate &amp; review tags"
   )
   expect_true(all(vapply(expected, grepl, logical(1), x = html, fixed = TRUE)))
 })
