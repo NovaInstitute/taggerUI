@@ -13,8 +13,5 @@ run_fluree_tagger_app(launch.browser = TRUE)
 A Shiny app object, invisibly when launched.
 }
 \description{
-Starts a local Shiny interface for loading forms, embedding with
-a configured model provider, inferring BERTopic hierarchy levels,
-loading/querying Fluree, tagging
-bottom-up, inspecting every request/response, and reviewing proposals.
+Launch the Fluree tagging walkthrough
 }
