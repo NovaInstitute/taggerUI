@@ -28,10 +28,22 @@ test_that("graph defaults reproduce the integration named-graph layout", {
 test_that("review workflow controls are present in the UI", {
   html <- as.character(taggerUI:::.walkthrough_app_ui())
   expected <- c(
-    "generate_proposal", "edited_tag", "reviewer_id",
+    "generate_proposal", "current_proposal", "edited_tag", "reviewer_id",
     "accept_proposal", "edit_proposal", "reject_proposal", "defer_proposal"
   )
   expect_true(all(vapply(expected, grepl, logical(1), x = html, fixed = TRUE)))
+})
+
+test_that("guided demo workspace is self-contained and reviewable", {
+  demo <- taggerUI:::.guided_demo_workspace()
+  expect_equal(nrow(demo$questions), 48L)
+  expect_equal(nrow(demo$workflow$state$clusters), 30L)
+  expect_equal(nrow(demo$question_queue), 4L)
+  expect_true(any(vapply(
+    demo$workflow$state$proposals,
+    function(proposal) identical(proposal$status, "proposed"), logical(1)
+  )))
+  expect_true(novaTagger::tag_store_exists(demo$store))
 })
 
 test_that("simple tagging progress controls are present in the UI", {

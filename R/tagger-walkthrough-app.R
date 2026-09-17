@@ -145,7 +145,9 @@
     questions = NULL, workflow = NULL, store = NULL,
     connection_message = "Not connected",
     model_message = "No model request in this session",
-    connected = FALSE, load_message = "No data loaded in this session"
+    connected = FALSE, demo_mode = FALSE, active_branch = NULL,
+    question_queue = NULL,
+    load_message = "No data loaded in this session"
   )
 
   .connect_resume_server("connect_resume", rv)

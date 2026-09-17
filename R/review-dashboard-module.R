@@ -60,20 +60,26 @@
     ),
     shiny::uiOutput(ns("next_action")),
     shiny::fluidRow(
-      shiny::column(4, shiny::wellPanel(
+      shiny::column(3, shiny::wellPanel(
         shiny::h4("Questions"), shiny::textOutput(ns("question_count"))
       )),
-      shiny::column(4, shiny::wellPanel(
+      shiny::column(3, shiny::wellPanel(
         shiny::h4("Hierarchy nodes"), shiny::textOutput(ns("cluster_count"))
       )),
-      shiny::column(4, shiny::wellPanel(
+      shiny::column(3, shiny::wellPanel(
         shiny::h4("Review decisions"), shiny::textOutput(ns("review_count"))
+      )),
+      shiny::column(3, shiny::wellPanel(
+        shiny::h4("Queued questions"), shiny::textOutput(ns("queue_count"))
       ))
     ),
     shiny::h4("Work needing attention"),
     DT::DTOutput(ns("issues")),
     shiny::h4("Hierarchy at a glance"),
-    DT::DTOutput(ns("level_summary"))
+    DT::DTOutput(ns("level_summary")),
+    shiny::h4("Question review queue"),
+    shiny::p("These are questions whose cluster placement needs a human decision after taxonomy review."),
+    DT::DTOutput(ns("question_queue"))
   )
 }
 
@@ -105,6 +111,10 @@
       if (is.null(rv$workflow)) "No run resumed" else
         length(rv$workflow$state$review_events %||% list())
     })
+    output$queue_count <- shiny::renderText({
+      queue <- rv$question_queue %||% data.frame()
+      if (!nrow(queue)) "No queued questions" else nrow(queue)
+    })
     output$issues <- DT::renderDT(DT::datatable(
       issues(), rownames = FALSE, options = list(dom = "t", ordering = FALSE)
     ))
@@ -112,6 +122,11 @@
       if (is.null(rv$workflow)) return(DT::datatable(data.frame()))
       data <- .tagging_level_progress(rv$workflow)
       DT::datatable(data, rownames = FALSE, options = list(dom = "t", ordering = FALSE))
+    })
+    output$question_queue <- DT::renderDT({
+      queue <- rv$question_queue %||% data.frame()
+      DT::datatable(queue, rownames = FALSE, filter = "top",
+                    options = list(pageLength = 10, dom = "tip", scrollX = TRUE))
     })
   })
 }

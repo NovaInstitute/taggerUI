@@ -86,7 +86,15 @@
         shiny::selectizeInput(ns("split_parent"), "Parent node", choices = character(),
                               options = list(maxOptions = 2000)),
         shiny::h4("Current path"),
-        shiny::textOutput(ns("parent_path"))
+        shiny::textOutput(ns("parent_path")),
+        shiny::hr(),
+        shiny::h4("Queue a tag correction"),
+        shiny::selectInput(ns("correction_child"), "Child to correct", choices = character()),
+        shiny::textInput(ns("correction_tag"), "Replacement tag"),
+        shiny::textAreaInput(ns("correction_rationale"), "Why this is clearer", rows = 2),
+        shiny::actionButton(ns("queue_correction"), "Queue correction for review",
+                            class = "btn-primary"),
+        shiny::p("This creates a reviewable proposal; it does not change the tag until accepted.")
       ),
       shiny::column(
         8,
@@ -100,10 +108,7 @@
     ),
     shiny::h4("Child groups and representative questions"),
     DT::DTOutput(ns("split_children")),
-    shiny::p(
-      "This page is an inspection step. Rename, merge, collapse, and split actions "
-        , "will be added as previewed changes in later increments."
-    )
+    shiny::p("Use the correction queue for label changes. Structural merge, collapse, split, and question moves remain intentionally separate from label review.")
   )
 }
 
@@ -124,6 +129,57 @@
     selected_parent <- shiny::reactive({
       shiny::req(rv$workflow, nzchar(input$split_parent %||% ""))
       .parse_cluster_key(input$split_parent)
+    })
+    shiny::observe({
+      if (is.null(rv$workflow) || !nzchar(input$split_parent %||% "")) return()
+      parent <- selected_parent()
+      children <- .hierarchy_split_children(
+        rv$workflow$state, parent$level, parent$cluster_id
+      )
+      choices <- if (!nrow(children)) character() else stats::setNames(
+        paste(children$child_level, children$child_cluster, sep = ":"),
+        paste0("Level ", children$child_level, ": ", children$tag)
+      )
+      shiny::updateSelectInput(session, "correction_child", choices = choices)
+    })
+    shiny::observeEvent(input$queue_correction, {
+      shiny::req(rv$workflow, rv$store, nzchar(input$correction_child %||% ""))
+      if (!isTRUE(rv$demo_mode) && identical(rv$active_branch, "main")) {
+        shiny::showNotification(
+          "Main is read-only. Create or select a review workspace before queuing a correction.",
+          type = "error", duration = NULL
+        )
+        return()
+      }
+      tag <- trimws(input$correction_tag %||% "")
+      if (!nzchar(tag)) {
+        shiny::showNotification("Enter a replacement tag.", type = "error")
+        return()
+      }
+      child <- .parse_cluster_key(input$correction_child)
+      result <- tryCatch({
+        state <- novaTagger::register_tag_proposal(
+          rv$workflow$state, child$level, child$cluster_id, tag,
+          confidence = NA_real_,
+          rationale = trimws(input$correction_rationale %||% ""),
+          needs_review = TRUE, provider = "reviewer", model = "manual",
+          embedding_model = if (isTRUE(rv$demo_mode)) "guided-demo-embedding" else NA_character_,
+          tag_embedding = if (isTRUE(rv$demo_mode)) {
+            .demo_embedding(tag, ncol(rv$workflow$state$embeddings))
+          } else NULL
+        )
+        state$workflow$stage <- "review"
+        rv$workflow$state <- novaTagger::tag_store_save(rv$store, state)
+        shiny::showNotification(
+          "Correction queued. Open Generate & review tags to accept or modify it.",
+          type = "message", duration = 7
+        )
+        TRUE
+      }, error = function(error) {
+        shiny::showNotification(conditionMessage(error), type = "error", duration = NULL)
+        FALSE
+      })
+      invisible(result)
     })
     output$parent_path <- shiny::renderText({
       parent <- selected_parent()

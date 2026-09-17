@@ -1,9 +1,12 @@
 .connect_resume_ui <- function(id) {
   ns <- shiny::NS(id)
   shiny::sidebarLayout(
-    shiny::sidebarPanel(
-      shiny::h4("1. Connect"),
-      shiny::textInput(ns("fluree_url"), "Fluree URL", "http://localhost:8090"),
+      shiny::sidebarPanel(
+        shiny::h4("1. Connect"),
+        shiny::actionButton(ns("load_guided_demo"), "Load guided demo", class = "btn-info"),
+        shiny::p("A safe local walkthrough with no connection, API key, or writes to Fluree."),
+        shiny::hr(),
+        shiny::textInput(ns("fluree_url"), "Fluree URL", "http://localhost:8090"),
       shiny::textInput(ns("ledger"), "Ledger", ""),
       shiny::textInput(ns("branch"), "Branch", "main"),
       shiny::actionButton(ns("connect"), "Connect to Fluree", class = "btn-primary"),
@@ -134,9 +137,11 @@
     }, ignoreInit = TRUE)
 
     invalidate_run <- function(connection = FALSE) {
-      rv$questions <- NULL; rv$workflow <- NULL; rv$store <- NULL
+      rv$questions <- NULL; rv$workflow <- NULL; rv$store <- NULL; rv$question_queue <- NULL
+      rv$demo_mode <- FALSE
       if (connection) {
         rv$connected <- FALSE
+        rv$active_branch <- NULL
         rv$connection_message <- "Connection settings changed; reconnect"
       }
     }
@@ -150,6 +155,7 @@
     )
 
     shiny::observeEvent(input$connect, {
+      rv$demo_mode <- FALSE
       result <- notify_error(shiny::withProgress(
         message = "Checking Fluree and ledger", value = 0.3,
         novaRush::fluree_connect(
@@ -161,11 +167,32 @@
       ))
       if (!is.null(result)) {
         rv$connected <- TRUE
+        rv$active_branch <- trimws(input$branch)
         rv$connection_message <- paste0(
           "Connected to ", trimws(input$ledger), ":", trimws(input$branch)
         )
         refresh_branches()
       }
+    })
+
+    shiny::observeEvent(input$load_guided_demo, {
+      demo <- .guided_demo_workspace()
+      rv$questions <- demo$questions
+      rv$workflow <- demo$workflow
+      rv$store <- demo$store
+      rv$question_queue <- demo$question_queue
+      rv$demo_mode <- TRUE
+      rv$connected <- FALSE
+      rv$active_branch <- "guided-demo"
+      rv$connection_message <- "Guided demo workspace — local only; no Fluree writes"
+      rv$load_message <- paste0(
+        "Loaded guided demo: ", nrow(demo$questions), " questions and ",
+        nrow(demo$workflow$state$clusters), " hierarchy nodes."
+      )
+      shiny::showNotification(
+        "Guided demo loaded. Inspect the repeated tag, then correct it in Generate & review tags.",
+        type = "message", duration = 8
+      )
     })
 
     shiny::observeEvent(input$refresh_branches, refresh_branches())
@@ -279,7 +306,7 @@
       if (!nzchar(branch)) return(NULL)
       if (identical(branch, "main")) {
         shiny::div(class = "alert alert-warning",
-                   "You are connected to main. Saved review actions modify main.")
+                   "Main is the protected published baseline. Create and select a review workspace before making changes.")
       } else shiny::div(class = "alert alert-info",
                         "Review changes are isolated on branch: ", branch)
     })

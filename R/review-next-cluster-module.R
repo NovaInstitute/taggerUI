@@ -15,6 +15,8 @@
         shiny::textOutput(ns("model_activity")),
         shiny::hr(),
         shiny::h4("Review current proposal"),
+        shiny::selectizeInput(ns("current_proposal"), "Proposal", choices = character(),
+                              options = list(maxOptions = 2000)),
         shiny::textInput(ns("edited_tag"), "Tag label"),
         shiny::textInput(ns("reviewer_id"), "Reviewer ID", "reviewer"),
         shiny::textAreaInput(ns("review_rationale"), "Rationale", rows = 3),
@@ -60,6 +62,13 @@
       shiny::showNotification(conditionMessage(error), type = "error", duration = NULL)
       NULL
     })
+    require_writable_workspace <- function() {
+      if (!isTRUE(rv$demo_mode) && identical(rv$active_branch, "main")) {
+        stop("Main is read-only. Create or select a review workspace before saving changes.",
+             call. = FALSE)
+      }
+      invisible(TRUE)
+    }
     embedding_dimensions <- function() {
       shiny::req(rv$workflow)
       embeddings <- rv$workflow$state$embeddings
@@ -69,6 +78,7 @@
       ncol(embeddings)
     }
     openai_provider <- function() {
+      if (isTRUE(rv$demo_mode)) return(.demo_model_provider(embedding_dimensions()))
       key <- trimws(input$openai_key %||% "")
       if (!nzchar(key)) key <- Sys.getenv("OPENAI_API_KEY", unset = "")
       config <- novaTagger::openai_config(
@@ -116,6 +126,29 @@
       ]
       current_proposal_id(if (length(awaiting)) utils::tail(awaiting, 1L) else NULL)
     })
+    shiny::observe({
+      if (is.null(rv$workflow)) {
+        shiny::updateSelectizeInput(session, "current_proposal", choices = character(),
+                                    server = TRUE)
+        return()
+      }
+      rows <- .proposal_table(rv$workflow$state)
+      rows <- rows[rows$status %in% c("proposed", "deferred"), , drop = FALSE]
+      choices <- if (!nrow(rows)) character() else stats::setNames(
+        rows$proposal_id,
+        paste0("L", rows$level, " / C", rows$cluster_id, ": ", rows$tag,
+               " [", rows$status, "]")
+      )
+      current <- current_proposal_id()
+      selected <- if (!is.null(current) && current %in% unname(choices)) current else
+        if (length(choices)) utils::tail(unname(choices), 1L) else character()
+      shiny::updateSelectizeInput(session, "current_proposal", choices = choices,
+                                  selected = selected, server = TRUE)
+    })
+    shiny::observeEvent(input$current_proposal, {
+      selected <- input$current_proposal %||% ""
+      current_proposal_id(if (nzchar(selected)) selected else NULL)
+    }, ignoreInit = TRUE)
     current_proposal <- shiny::reactive({
       if (is.null(rv$workflow)) return(NULL)
       .selected_proposal(rv$workflow$state, current_proposal_id())
@@ -128,6 +161,7 @@
 
     shiny::observeEvent(input$generate_proposal, {
       shiny::req(rv$workflow, rv$store)
+      require_writable_workspace()
       result <- notify_error(shiny::withProgress(
         message = "Generating and saving the next proposal", value = 0.1, {
           target <- novaTagger::workflow_next_cluster(rv$workflow)
@@ -152,6 +186,7 @@
     review_selected <- function(decision) {
       proposal_id <- current_proposal_id()
       shiny::req(rv$workflow, rv$store, nzchar(proposal_id %||% ""))
+      require_writable_workspace()
       result <- notify_error(shiny::withProgress(
         message = paste("Saving reviewer decision:", decision), value = 0.2, {
           proposal <- .selected_proposal(rv$workflow$state, proposal_id)
