@@ -11,15 +11,15 @@ Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.2
 Depends: R (>= 4.2)
 Imports:
+    DT,
     dplyr,
     jsonlite,
-    shiny,
-    tibble
-Suggests:
-    DT,
-    novaGraphDB,
     novaRush,
     novaTagger,
-    testthat,
+    shiny,
+    tibble,
     visNetwork
+Suggests:
+    novaGraphDB,
+    testthat
 Config/testthat/edition: 3

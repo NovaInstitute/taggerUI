@@ -67,7 +67,9 @@
 
 .proposal_question_scores <- function(state, proposal) {
   if (is.null(proposal)) return(tibble::tibble())
-  if (is.null(proposal$tag_embedding)) {
+  incompatible <- !is.null(proposal$tag_embedding) && is.matrix(state$embeddings) &&
+    length(proposal$tag_embedding) != ncol(state$embeddings)
+  if (is.null(proposal$tag_embedding) || incompatible) {
     profile <- novaTagger::get_cluster_profile(
       state, proposal$cluster_id, proposal$level, sample_size = 1000L
     )
@@ -79,7 +81,11 @@
       question_id = questions$question_id,
       question = questions$question_text,
       cosine_similarity = NA_real_, cosine_distance = NA_real_,
-      low_similarity = NA
+      low_similarity = NA,
+      score_note = if (incompatible) {
+        paste0("Stored tag vector has ", length(proposal$tag_embedding),
+               " dimensions; question vectors have ", ncol(state$embeddings), ".")
+      } else "Tag embedding is unavailable."
     ))
   }
   novaTagger::score_cluster_tag_similarity(
@@ -152,5 +158,89 @@
       current_tag = as.character(target$tag[[1]])
     ),
     questions = questions
+  )
+}
+
+.proposal_cluster_summary <- function(workflow, proposal) {
+  if (is.null(workflow) || is.null(proposal)) {
+    return(list(cluster = tibble::tibble(), questions = tibble::tibble()))
+  }
+  row <- workflow$state$clusters[
+    workflow$state$clusters$level == as.integer(proposal$level) &
+      as.character(workflow$state$clusters$cluster_id) ==
+        as.character(proposal$cluster_id), , drop = FALSE
+  ]
+  if (nrow(row) != 1L) {
+    stop("The proposal must identify exactly one cluster.", call. = FALSE)
+  }
+  scores <- .proposal_question_scores(workflow$state, proposal)
+  question_rows <- match(scores$question_id, workflow$state$questions$id)
+  if ("question_class" %in% names(workflow$state$questions)) {
+    scores$question_class <- as.character(
+      workflow$state$questions$question_class[question_rows]
+    )
+  }
+  if ("source_form_id" %in% names(workflow$state$questions)) {
+    scores$source_form_id <- as.character(
+      workflow$state$questions$source_form_id[question_rows]
+    )
+  }
+  list(
+    cluster = tibble::tibble(
+      level = as.integer(proposal$level),
+      cluster_id = as.character(proposal$cluster_id),
+      question_count = length(row$question_ids[[1]]),
+      proposed_tag = as.character(proposal$tag),
+      proposal_status = as.character(proposal$status)
+    ),
+    questions = scores
+  )
+}
+
+.tagging_level_progress <- function(workflow) {
+  if (is.null(workflow) || is.null(workflow$state$clusters)) return(tibble::tibble())
+  state <- workflow$state
+  clusters <- state$clusters
+  status <- vapply(seq_len(nrow(clusters)), function(index) {
+    proposal <- .quality_latest_proposal(
+      state, clusters$level[[index]], clusters$cluster_id[[index]]
+    )
+    if (is.null(proposal)) "pending" else as.character(proposal$status)
+  }, character(1))
+  levels <- sort(unique(as.integer(clusters$level)))
+  dplyr::bind_rows(lapply(levels, function(level) {
+    rows <- which(clusters$level == level)
+    reviewed <- status[rows] %in% c("accepted", "edited", "rejected")
+    tagged <- !is.na(clusters$tag[rows]) & nzchar(clusters$tag[rows]) &
+      clusters$tag[rows] != "untagged"
+    tibble::tibble(
+      level = level, clusters = length(rows), reviewed = sum(reviewed),
+      tagged = sum(tagged), awaiting_decision = sum(status[rows] %in% c("proposed", "deferred")),
+      progress_percent = round(100 * sum(reviewed) / length(rows), 1)
+    )
+  }))
+}
+
+.tagging_cluster_overview <- function(workflow, level = NULL) {
+  if (is.null(workflow) || is.null(workflow$state$clusters)) return(tibble::tibble())
+  state <- workflow$state
+  clusters <- state$clusters
+  keep <- rep(TRUE, nrow(clusters))
+  if (!is.null(level) && !identical(as.character(level), "all")) {
+    keep <- clusters$level == as.integer(level)
+  }
+  clusters <- clusters[keep, , drop = FALSE]
+  if (!nrow(clusters)) return(tibble::tibble())
+  tibble::tibble(
+    level = as.integer(clusters$level),
+    cluster_id = as.character(clusters$cluster_id),
+    question_count = lengths(clusters$question_ids),
+    tag = as.character(clusters$tag),
+    status = vapply(seq_len(nrow(clusters)), function(index) {
+      proposal <- .quality_latest_proposal(
+        state, clusters$level[[index]], clusters$cluster_id[[index]]
+      )
+      if (is.null(proposal)) "pending" else as.character(proposal$status)
+    }, character(1))
   )
 }
