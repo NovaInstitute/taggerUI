@@ -8,7 +8,6 @@ Description: A Shiny reviewer interface for importing survey knowledge and
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.2
 Depends: R (>= 4.2)
 Imports:
     DT,
@@ -23,3 +22,4 @@ Suggests:
     novaGraphDB,
     testthat
 Config/testthat/edition: 3
+Config/roxygen2/version: 8.0.0

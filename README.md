@@ -6,6 +6,28 @@ by `novaTagger`, optionally initiates imports through `novaGraphDB`, and uses
 
 Reactive state is never authoritative project state.
 
+## Running the reviewer app
+
+The standalone taxonomy-reviewer app lives in `reviewerWalkthrough/`, and a
+root-level `app.R` delegates to it, so it can be started from the project root
+in any of these ways:
+
+```r
+# From an R session with the project root as the working directory
+shiny::runApp()
+```
+
+```sh
+# From the command line
+Rscript run-reviewer-app.R
+```
+
+In RStudio, open `app.R` (or the `taggerUI.Rproj` project) and use **Run App**.
+
+`R/_disable_autoload.R` stops Shiny from sourcing the package code in `R/`
+when the app is launched this way; the app only uses the files under
+`reviewerWalkthrough/`.
+
 Construct the application with `tagger_app()` or launch it with
 `run_fluree_tagger_app()`. The first page separates a lightweight Fluree
 connection check from loading survey questions and reconstructing a persisted

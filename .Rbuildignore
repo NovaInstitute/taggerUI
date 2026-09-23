@@ -3,3 +3,9 @@
 ^\.RData$
 ^\.Ruserdata$
 ^.*\.Rproj$
+^app\.R$
+^run-reviewer-app\.R$
+^reviewerWalkthrough$
+^R/_disable_autoload\.R$
+^docs$
+^ISSUES\.md$
