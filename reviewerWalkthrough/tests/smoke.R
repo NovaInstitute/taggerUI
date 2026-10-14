@@ -1,0 +1,77 @@
+# Run from the repository root: Rscript taggerUI/reviewerWalkthrough/tests/smoke.R
+args <- commandArgs(trailingOnly=FALSE)
+file <- sub('^--file=', '', args[grepl('^--file=',args)])
+setwd(normalizePath(file.path(dirname(file),'..')))
+Sys.setenv(NOVA_REVIEW_MODE='demo')
+tagger_paths <- c('../../novaTagger','../../semanticTagger')
+tagger_path <- tagger_paths[dir.exists(tagger_paths)][1L]
+if(is.na(tagger_path)) stop('Could not find a sibling novaTagger or semanticTagger checkout.')
+pkgload::load_all(tagger_path,quiet=TRUE)
+library(shiny)
+source('R/model.R'); source('R/persistence.R'); source('R/editor.R');source('R/ui.R'); source('R/server.R')
+s <- mock_state()
+stopifnot(nrow(s$questions)==48,length(leaf_ids(s))==16,length(split_order(s))==15)
+stopifnot(all(vapply(children(s,1),function(id) nrow(representatives(s,id))>=3,logical(1))))
+stopifnot(length(split_warnings(s,5))>=1,length(split_warnings(s,10))>=1)
+stopifnot(inherits(shinyApp(app_ui(),app_server),'shiny.appobj'))
+ui_html <- as.character(app_ui())
+stopifnot(!grepl('demo|simulation',ui_html,ignore.case=TRUE),
+  !grepl('Guided review',ui_html,fixed=TRUE),
+  !grepl('Question placement',ui_html,fixed=TRUE),
+  !grepl('Read-only tree',ui_html,fixed=TRUE),
+  !grepl('Search questions in this category',ui_html,fixed=TRUE),
+  grepl('Inspect questions by category',ui_html,fixed=TRUE),
+  grepl('2. Taxonomy editor',ui_html,fixed=TRUE))
+# Pure helpers: internal collapse promotes children; leaf collapse leaves no dangling IDs.
+s <- review_split(s,'collapse',2)
+stopifnot(!2 %in% s$nodes$id,all(s$nodes$parent[s$nodes$id %in% c(4,5)]==1),length(s$affected)==24)
+s <- mock_state(); while(current_split(s)!=8) s <- review_split(s,'approve')
+s <- review_split(s,'collapse',16)
+stopifnot(!16 %in% leaf_ids(s),all(s$questions$leaf[1:3]==8),all(1:3 %in% queue_ids(s)))
+# Each user button and all five placement choices, including validation and reset.
+testServer(app_server, {
+  session$flushReact()
+  stopifnot(grepl('Do you',output$review_content$html,fixed=TRUE))
+  session$setInputs(branch='main',connect=1)
+  stopifnot(connected(),active()=='main')
+  session$setInputs(approve=1);stopifnot(length(state()$reviewed)==0)
+  session$setInputs(branch_name='review-test',create_branch=1)
+  stopifnot(active()=='review-test','review-test' %in% branches())
+  session$setInputs(create_branch=2);stopifnot(length(branches())==3)
+  session$setInputs(start=1)
+  session$setInputs(approve=2);stopifnot(length(state()$reviewed)==1)
+  session$setInputs(rename_child=4,replacement='',rename=1);stopifnot(length(state()$reviewed)==1)
+  session$setInputs(replacement='Body and daily health',rename=2)
+  stopifnot(node_label(state(),4)=='Body and daily health',length(state()$reviewed)==2)
+  session$setInputs(collapse_child=8,collapse=1)
+  stopifnot(!8 %in% state()$nodes$id,all(c(16,17) %in% children(state(),4)))
+  session$setInputs(defer=1);stopifnot(sum(state()$history$action=='defer')==1)
+  for(i in 3:25) session$setInputs(approve=i)
+  stopifnot(is.na(current_split(state())),grepl('first pass is done',output$review_content$html))
+  n <- nrow(state()$history);session$setInputs(approve=26);stopifnot(nrow(state()$history)==n)
+  session$setInputs(go_place=1)
+  # Fresh fixtures isolate decisions without depending on browser input timing.
+  state(mock_state());session$flushReact()
+  session$setInputs(decision='keep',place=1);stopifnot(state()$placements$decision[1]=='kept',length(queue_ids(state()))==3)
+  session$setInputs(decision='suggested',place=2);stopifnot(state()$questions$leaf[18]==17)
+  session$setInputs(decision='other',destination=27,place=3);stopifnot(state()$questions$leaf[33]==27)
+  session$setInputs(decision='new',new_name='Support networks',new_parent=11,rationale='',place=4)
+  stopifnot(state()$new_count==0)
+  session$setInputs(rationale='Separate informal support from recovery.',place=5)
+  stopifnot(state()$new_count==1,state()$questions$leaf[48]==32,length(queue_ids(state()))==0)
+  stopifnot(grepl('Every queued question',output$placement_content$html))
+  session$setInputs(go_summary=1);stopifnot(nchar(output$summary$html)>100)
+  state(mock_state());session$flushReact()
+  session$setInputs(decision='unresolved',place=6)
+  stopifnot(12 %in% state()$unresolved,length(queue_ids(state()))==4,queue_item(state())==18)
+  for(i in 7:9) session$setInputs(decision='keep',place=i)
+  stopifnot(queue_item(state())==12)
+  session$setInputs(decision='suggested',place=10);stopifnot(length(queue_ids(state()))==0,length(state()$unresolved)==0)
+  # An early placement is requeued when its branch is later collapsed.
+  session$setInputs(collapse_child=2,collapse=2);stopifnot(18 %in% queue_ids(state()))
+  # Switching branches preserves drafts and baseline stays pristine.
+  saved <- state(); session$setInputs(branch='review-alex',connect=2);stopifnot(length(state()$reviewed)==0)
+  session$setInputs(branch='review-test',connect=3);stopifnot(identical(state(),saved))
+  session$setInputs(reset=1);stopifnot(identical(state(),mock_state()),length(branches())==2,active()=='review-alex',!connected())
+})
+cat('PASS: construction, data, top-level examples, review actions, all placement choices, branch isolation, reset.\n')
