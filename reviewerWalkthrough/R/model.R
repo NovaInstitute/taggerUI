@@ -8,7 +8,8 @@ mock_state <- function() {
     'Mood and worry','Mood and worry','Social support','Rest and recovery',
     'Education','Employment','Income','Housing stability','Healthcare access','Transport access',
     'Neighbourhood safety','Community participation')
-  nodes <- data.frame(id=1:31, parent=c(NA_integer_, rep(1:15, each=2)), label=labels)
+  nodes <- data.frame(id=1:31, parent=c(NA_integer_, rep(1:15, each=2)), label=labels,
+                      stable_id=paste0('mock-',1:31))
   texts <- list(
     c('Do you currently smoke tobacco?','How often do you use tobacco?','Have you tried to stop smoking?'),
     c('How often do you drink alcohol?','How many drinks do you have in a typical week?','Has drinking affected your daily routine?'),
@@ -34,7 +35,7 @@ mock_state <- function() {
     'This asks about alcohol use rather than everyday stress.',
     'This asks about housing stability rather than income alone.',
     'This asks about personal support rather than community activities.')
-  list(nodes=nodes, questions=q, reviewed=integer(), history=data.frame(action=character(),detail=character()),
+  list(nodes=nodes, questions=q, reviewed=integer(), history=data.frame(action=character(),detail=character()),deferred=integer(),
        affected=integer(), resolved=integer(), unresolved=integer(),
        placements=data.frame(id=integer(),decision=character()), new_count=0L)
 }
@@ -75,6 +76,8 @@ review_split <- function(s,action,child=NULL,label='') {
     s$next_node_id <- max(s$nodes$id,if(is.null(s$next_node_id)) 0L else s$next_node_id)
     s$nodes <- s$nodes[s$nodes$id!=child,,drop=FALSE]
   }
+  if(action=='defer') s$deferred <- union(s$deferred %||% integer(),id) else
+    s$deferred <- setdiff(s$deferred %||% integer(),id)
   s$reviewed <- c(s$reviewed,id)
   add_history(s,action,detail)
 }
@@ -83,7 +86,7 @@ queue_item <- function(s) {
   ids <- queue_ids(s); fresh <- setdiff(ids,s$unresolved)
   if(length(fresh)) fresh[1] else if(length(ids)) ids[1] else NA_integer_
 }
-place_question <- function(s,decision,destination=NULL,name='',parent=NULL,rationale='') {
+place_question <- function(s,decision,destination=NULL,name='',parent=NULL,rationale='',node_key=NULL) {
   id <- queue_item(s); if(is.na(id)) return(s)
   row <- match(id,s$questions$id); old <- s$questions$leaf[row]
   if(!decision %in% c('keep','suggested','other','new','unresolved')) stop('Choose a placement decision.')
@@ -99,6 +102,7 @@ place_question <- function(s,decision,destination=NULL,name='',parent=NULL,ratio
     new_node <- s$nodes[1,,drop=FALSE]
     new_node[1,] <- NA
     new_node$id <- destination;new_node$parent <- parent;new_node$label <- name
+    new_node$stable_id <- as.character(node_key %||% paste0('created-',destination))
     s$nodes <- rbind(s$nodes,new_node)
     s$new_count <- s$new_count+1L
     s <- add_history(s,'new leaf',paste(node_path(s,destination),'—',rationale))

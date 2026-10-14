@@ -1,5 +1,7 @@
 library(shiny)
+addResourcePath('editor-assets',normalizePath('www'))
 source('R/model.R', local=TRUE)
+source('R/editor.R', local=TRUE)
 source('R/ui.R', local=TRUE)
 source('R/persistence.R', local=TRUE)
 source('R/server.R', local=TRUE)
