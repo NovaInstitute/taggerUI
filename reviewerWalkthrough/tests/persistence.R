@@ -25,6 +25,18 @@ restored <- review_state_from_taxonomy(published,raw$questions)
 stopifnot(nrow(restored$nodes)==nrow(baseline$nodes),
   nrow(restored$questions)==nrow(baseline$questions),
   setequal(restored$nodes$stable_id,baseline$nodes$stable_id))
+# Publication change counts tolerate duplicate siblings in the pipeline source;
+# only the cleaned checkpoint must satisfy canonical publication validation.
+duplicate_source <- baseline
+parent_counts <- table(duplicate_source$nodes$parent)
+duplicate_parent <- as.integer(names(parent_counts)[which.max(parent_counts)])
+siblings <- duplicate_source$nodes$id[!is.na(duplicate_source$nodes$parent) & duplicate_source$nodes$parent==duplicate_parent]
+duplicate_source$nodes$label[match(siblings[1:2],duplicate_source$nodes$id)] <- c('Repeated label','repeated LABEL')
+expect_error(review_state_to_taxonomy(duplicate_source,raw$run_id,raw$revision),'Sibling taxonomy labels')
+clean_checkpoint <- apply_review_command(duplicate_source,list(type='edit',action='deduplicate'))
+checkpoint <- review_state_to_taxonomy(clean_checkpoint,raw$run_id,raw$revision+1L)
+changes <- review_state_change_counts(duplicate_source,clean_checkpoint)
+stopifnot(inherits(checkpoint,'reviewed_taxonomy'),changes[['clusters_removed']]==1L)
 # Persist JSON to disk, then construct fresh sessions to verify restart behaviour.
 folder <- tempfile();dir.create(folder)
 read_events <- function() lapply(list.files(folder,full.names=TRUE),function(p) jsonlite::fromJSON(p,simplifyVector=TRUE))
@@ -53,7 +65,7 @@ expect_error(new_review_session(baseline,read_events,append_event,'x'),'Conflict
 unlink(file.path(folder,'conflicting-id.json'))
 # A failing write must not advance the UI. Use an injected backend and fresh journal.
 folder <- tempfile();dir.create(folder)
-fail <- FALSE;prepared_calls <- 0L;merge_calls <- 0L;connect_calls <- 0L
+fail <- FALSE;checkpoint_calls <- 0L;prepared_calls <- 0L;merge_calls <- 0L;connect_calls <- 0L;progress_calls <- 0L
 list_calls <- 0L;create_calls <- 0L;connected_branches <- character()
 mock_branches <- c('main','review-test')
 backend <- list(
@@ -62,12 +74,22 @@ backend <- list(
     create_calls <<- create_calls+1L;mock_branches <<- c(mock_branches,name)
     list(created=TRUE)
   },
-  connect=function(settings) {
+  connect=function(settings,progress=function(value,message,detail=NULL) invisible(NULL)) {
     connect_calls <<- connect_calls+1L;connected_branches <<- c(connected_branches,settings$branch)
+    progress_calls <<- progress_calls+1L;progress(0.5,'Loading test workspace','Testing progress reporting…')
     x <- new_review_session(baseline,read_events,function(e) {if(fail) stop('Network unavailable');append_event(e)},settings$reviewer,settings$branch=='main')
-    c(x,list(branches=mock_branches,settings=settings,
-      prepare_publish=function(state,head,note) {prepared_calls <<- prepared_calls+1L;list(id='publish-test',changes=c(clusters_renamed=1L))},
-      merge_publish=function(prepared) {merge_calls <<- merge_calls+1L;list(main_head='head-2',publication_id=prepared$id)}))
+    c(x,list(branches=mock_branches,settings=settings,journal_events=length(read_events()),
+      create_checkpoint=function(state,head,progress=NULL) {
+        checkpoint_calls <<- checkpoint_calls+1L
+        if(is.function(progress)) progress(1,'Checkpoint verified','Test checkpoint complete.')
+        list(id='checkpoint-test',state=state,head='baseline',changes=c(clusters_renamed=1L))
+      },
+      prepare_publication=function(state,head,note,progress=NULL) {
+        prepared_calls <<- prepared_calls+1L
+        if(is.function(progress)) progress(1,'Publication prepared','Test publication complete.')
+        list(id='publish-test',changes=c(clusters_renamed=1L))
+      },
+      merge_publish=function(prepared,progress=NULL) {merge_calls <<- merge_calls+1L;list(main_head='head-2',publication_id=prepared$id)}))
   }
 )
 Sys.unsetenv('NOVA_REVIEW_MODE')
@@ -78,7 +100,7 @@ testServer(live_test_server, {
   session$flushReact()
   stopifnot(!connected(),connect_calls==0L,list_calls>=1L)
   session$setInputs(reviewer='A',branch_name='review-created',create_branch=1)
-  stopifnot(connected(),nrow(state()$questions)==4,create_calls==1L,connect_calls==1L,
+  stopifnot(connected(),nrow(state()$questions)==4,create_calls==1L,connect_calls==1L,progress_calls==1L,
     identical(connected_branches,'review-created'),active()=='review-created')
   # testServer does not apply updateSelectizeInput messages back to input.
   session$setInputs(branch='review-created')
@@ -97,9 +119,13 @@ testServer(live_test_server, {
   session$setInputs(connect=3)
   stopifnot(length(state()$reviewed)==1)
   session$setInputs(editor_select=2L,editor_label='Life areas',editor_rename_save=2)
-  session$setInputs(prepare_publish=1)
-  stopifnot(prepared_calls==0L,is.null(prepared()))
-  session$setInputs(editor_save=2,prepare_publish=2)
+  session$setInputs(create_checkpoint=1)
+  stopifnot(checkpoint_calls==0L,is.null(prepared()))
+  session$setInputs(editor_save=2,prepare_publication=1)
+  stopifnot(prepared_calls==0L)
+  session$setInputs(create_checkpoint=2)
+  stopifnot(checkpoint_calls==1L,!checkpoint_dirty(),!locked())
+  session$setInputs(prepare_publication=2)
   stopifnot(prepared_calls==1L,!is.null(prepared()),locked())
   session$setInputs(merge_publish=1)
   stopifnot(merge_calls==1L,active()=='main',connected(),is.null(prepared()))
