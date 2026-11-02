@@ -1,5 +1,6 @@
 # Reviewer decisions are an append-only journal in a dedicated Fluree graph.
 # The pipeline run is the immutable input; replay produces the reviewer draft.
+.review_workspace_cache <- new.env(parent=emptyenv())
 review_json <- function(x) as.character(jsonlite::toJSON(x, auto_unbox=TRUE, null='null', na='null', digits=NA))
 review_hash <- function(x) digest::digest(review_json(x), algo='sha256', serialize=FALSE)
 empty_review_state <- function() list(
@@ -133,6 +134,35 @@ review_state_to_taxonomy <- function(s,run_id,revision) {
   taxonomy
 }
 
+# Compare editable states directly. The source pipeline taxonomy may contain
+# duplicate sibling labels that the reviewer cleanup is specifically intended
+# to fix, so it must not be forced through the stricter publication validator
+# merely to calculate preview counts.
+review_state_change_counts <- function(before,after) {
+  projection <- function(s) {
+    stable <- setNames(as.character(s$nodes$stable_id),as.character(s$nodes$id))
+    nodes <- setNames(as.character(s$nodes$label),as.character(s$nodes$stable_id))
+    leaves <- leaf_ids(s)
+    assigned <- s$questions$leaf %in% leaves
+    assignments <- setNames(
+      unname(stable[as.character(s$questions$leaf[assigned])]),
+      as.character(s$questions$id[assigned])
+    )
+    list(nodes=nodes,assignments=assignments)
+  }
+  old <- projection(before);new <- projection(after)
+  shared_nodes <- intersect(names(old$nodes),names(new$nodes))
+  shared_questions <- intersect(names(old$assignments),names(new$assignments))
+  c(
+    clusters_created=length(setdiff(names(new$nodes),names(old$nodes))),
+    clusters_removed=length(setdiff(names(old$nodes),names(new$nodes))),
+    clusters_renamed=sum(old$nodes[shared_nodes]!=new$nodes[shared_nodes]),
+    assignments_added=length(setdiff(names(new$assignments),names(old$assignments))),
+    assignments_removed=length(setdiff(names(old$assignments),names(new$assignments))),
+    assignments_moved=sum(old$assignments[shared_questions]!=new$assignments[shared_questions])
+  )
+}
+
 review_state_from_taxonomy <- function(taxonomy,questions) {
   novaTagger::validate_reviewed_taxonomy(taxonomy)
   q <- as.data.frame(questions)
@@ -248,38 +278,82 @@ fluree_review_backend <- function() {
     fluree_event_journal(config,branch_graph,name)$write_metadata(base_head,settings$reviewer)
     result
   }
-  connect <- function(settings) {
+  connect <- function(settings,progress=function(value,message,detail=NULL) invisible(NULL)) {
+    report <- function(value,message,detail=NULL) {
+      progress(value,message,detail)
+      invisible(NULL)
+    }
+    report(0.03,'Starting workspace load','Checking the configured packages and reviewer details…')
     require_dependencies()
     if(!nzchar(settings$reviewer)) stop('Enter your reviewer name.')
     config <- novaRush::setConfig(baseUrl=settings$url,ledger=settings$ledger,branch=settings$branch,
       apiKey=if(nzchar(Sys.getenv('FLUREE_API_KEY'))) Sys.getenv('FLUREE_API_KEY') else NULL,timeout=300)
+    report(0.08,'Checking the review branch',paste('Reading',settings$branch,'from Fluree…'))
     names <- list_branches(settings)
     if(!settings$branch %in% names) stop('That branch no longer exists. Refresh the branch list and choose another workspace.')
     locations <- locations_for(settings);survey <- locations$survey;base <- locations$base
-    questions <- novaTagger::query_taggable_questions(config,graph=survey,branch=settings$branch,page_size=500L)
+    question_key <- review_hash(list(url=settings$url,ledger=settings$ledger,survey=survey))
+    if(exists(question_key,envir=.review_workspace_cache,inherits=FALSE)) {
+      report(0.14,'Loading cached questions','Reusing the fixed survey corpus already loaded by this app server…')
+      questions <- get(question_key,envir=.review_workspace_cache,inherits=FALSE)
+    } else {
+      report(0.14,'Loading survey questions','Reading the fixed question corpus from main for the first server session…')
+      main_config <- config_for(settings,'main')
+      questions <- novaTagger::query_taggable_questions(main_config,graph=survey,branch='main',page_size=500L)
+      assign(question_key,questions,envir=.review_workspace_cache)
+    }
+    report(0.34,'Questions ready',paste(format(nrow(questions),big.mark=','),'questions available. Checking for a materialized taxonomy checkpoint…'))
     graphs <- setNames(as.list(paste0(base,c('run','embedding','hierarchy','review'))),c('run','embedding','hierarchy','review'))
-    repository <- novaTagger::novarush_semantic_repository(config,
-      graphs=graphs,
-      branch=settings$branch,query_page_size=500L)
+    taxonomy_repository <- novaTagger::novarush_reviewed_taxonomy_repository(
+      config,graphs,branch=settings$branch,query_page_size=500L)
     scope_iri <- novaTagger::tagging_entity_iri('run',settings$run_id)
-    semantic_records <- repository$load(scope_iri)
-    is_published <- any(vapply(semantic_records$run,function(node) !is.null(node[['https://data.nova.org/vocabulary/tagging/taxonomyChecksum']]),logical(1)))
+    report(0.40,'Reading the checkpoint header','Loading only the current run, reviewed taxonomy and publication marker…')
+    canonical_records <- taxonomy_repository$load(settings$run_id)
+    is_published <- any(vapply(canonical_records$run,function(node) !is.null(node[['https://data.nova.org/vocabulary/tagging/taxonomyChecksum']]),logical(1)))
     published_taxonomy <- NULL
     if(is_published) {
-      taxonomy <- novaTagger::reviewed_taxonomy_from_records(semantic_records)
+      report(0.58,'Loading the materialized checkpoint','Reconstructing current categories and question assignments; legacy pipeline records are skipped…')
+      taxonomy <- novaTagger::reviewed_taxonomy_from_records(canonical_records)
       published_taxonomy <- taxonomy
       baseline <- review_state_from_taxonomy(taxonomy,questions)
     } else {
+      report(0.47,'Loading the original taxonomy','No reviewer checkpoint exists yet. Reading the pipeline hierarchy without embeddings or proposal history…')
+      repository <- novaTagger::novarush_semantic_repository(config,
+        graphs=graphs,branch=settings$branch,query_page_size=500L,
+        load_embeddings=FALSE,load_review=FALSE)
       store <- novaTagger::semantic_tag_store(repository,questions,settings$run_id)
       raw <- novaTagger::tag_store_load(store)
       baseline <- review_from_pipeline(raw)
     }
+    report(0.76,'Taxonomy reconstructed',paste(nrow(baseline$nodes),'categories ready. Loading only changes saved since the latest checkpoint…'))
     graph <- paste0(base,'reviewer/',utils::URLencode(settings$branch,reserved=TRUE))
     journal <- fluree_event_journal(config,graph,settings$branch)
     read_events <- journal$read;append_event <- journal$append
     existing_events <- read_events()
+    # Journals created by earlier app versions fingerprinted a pipeline state
+    # that included embeddings and historical review assessments. The lean
+    # loader deliberately skips those partitions, so retain a compatibility
+    # fallback only when an existing event proves that the older fingerprint
+    # is required. New branches and checkpointed branches stay on the fast
+    # path.
+    if(!is_published && length(existing_events)) {
+      recorded_sources <- unique(vapply(existing_events,function(event)
+        as.character(event$source %||% ''),character(1)))
+      if(!all(recorded_sources==review_hash(baseline))) {
+        report(0.80,'Loading legacy journal compatibility data','This branch was saved by an earlier app version. Loading its original assessments and vectors once so no saved work is lost…')
+        legacy_repository <- novaTagger::novarush_semantic_repository(
+          config,graphs=graphs,branch=settings$branch,query_page_size=500L)
+        legacy_store <- novaTagger::semantic_tag_store(
+          legacy_repository,questions,settings$run_id)
+        legacy_baseline <- review_from_pipeline(
+          novaTagger::tag_store_load(legacy_store))
+        if(review_hash(legacy_baseline) %in% recorded_sources) {
+          baseline <- legacy_baseline
+        }
+      }
+    }
     metadata <- journal$read_metadata()
-    branch_publications <- Filter(function(node) identical(node[['@type']],'https://data.nova.org/vocabulary/tagging/TaxonomyPublication') && identical(as.character(node[['https://data.nova.org/vocabulary/tagging/sourceBranch']] %||% ''),settings$branch),semantic_records$review)
+    branch_publications <- Filter(function(node) identical(node[['@type']],'https://data.nova.org/vocabulary/tagging/TaxonomyPublication') && identical(as.character(node[['https://data.nova.org/vocabulary/tagging/sourceBranch']] %||% ''),settings$branch),canonical_records$review)
     prepared_existing <- NULL
     if(settings$branch!='main' && length(branch_publications) && !is.null(published_taxonomy)) {
       publication <- branch_publications[[length(branch_publications)]]
@@ -295,34 +369,65 @@ fluree_review_backend <- function() {
     recorded_heads <- recorded_heads[!is.na(recorded_heads)&nzchar(recorded_heads)]
     main_head <- novaRush::branchHead(config,'main')
     base_main_head <- if(settings$branch=='main') main_head else if(!is.null(prepared_existing)) prepared_existing$base_main_head else if(!is.null(metadata$base_main_head)) metadata$base_main_head else if(length(recorded_heads)==1L) recorded_heads else NA_character_
-    session <- new_review_session(baseline,read_events,append_event,settings$reviewer,settings$branch=='main'||!is.null(prepared_existing),base_main_head)
-    taxonomy_repository <- novaTagger::novarush_reviewed_taxonomy_repository(
-      config,graphs,branch=settings$branch,query_page_size=500L)
-    prepare_publish <- function(review_state,event_head,note='') {
+    report(0.86,'Restoring the review journal',paste(length(existing_events),'saved change event(s) found since the latest checkpoint.'))
+    current_baseline <- baseline
+    current_session <- new_review_session(current_baseline,read_events,append_event,settings$reviewer,settings$branch=='main'||!is.null(prepared_existing),base_main_head)
+    save <- function(command,expected_head) current_session$save(command,expected_head)
+    create_checkpoint <- function(review_state,event_head,progress=NULL) {
+      if(settings$branch=='main') stop('Main is already the published branch.')
+      current <- replay_review(current_baseline,read_events())
+      if(!identical(current$head,event_head)) stop('The review changed before checkpointing. Reconnect and try again.')
+      after <- review_state_to_taxonomy(current$state,settings$run_id,current_baseline$source$revision+1L)
+      changes <- review_state_change_counts(current_baseline,current$state)
+      result <- taxonomy_repository$checkpoint(after,progress=progress)
+      journal$clear_events()
+      remaining_events <- read_events()
+      # Fluree query visibility can lag a successful transaction on a busy
+      # server. Give the exact deletion a bounded verification window before
+      # reporting failure; never clear the in-memory baseline prematurely.
+      for(attempt in seq_len(5L)) {
+        if(!length(remaining_events)) break
+        Sys.sleep(0.4*attempt)
+        remaining_events <- read_events()
+      }
+      if(length(remaining_events)) stop('The checkpoint was verified, but the journal could not be cleared. Reconnect before continuing.')
+      current_baseline <<- review_state_from_taxonomy(after,questions)
+      current_session <<- new_review_session(current_baseline,read_events,append_event,settings$reviewer,FALSE,base_main_head)
+      list(id=paste0('checkpoint-',after$revision,'-',substr(after$taxonomy_checksum,1,12)),
+        taxonomy=after,changes=changes,state=current_session$state,head=current_session$head,
+        delta=result$delta,base_main_head=base_main_head)
+    }
+    prepare_publication <- function(review_state,event_head,note='',progress=NULL) {
       if(settings$branch=='main') stop('Main is already the published branch.')
       if(is.na(base_main_head)||!nzchar(base_main_head)) stop('This legacy review branch does not record its base main commit. Create a fresh branch from main before publishing.')
-      current <- replay_review(baseline,read_events())
-      if(!identical(current$head,event_head)) stop('The review changed before publication. Reconnect and try again.')
-      before <- review_state_to_taxonomy(baseline,settings$run_id,baseline$source$revision)
-      after <- review_state_to_taxonomy(current$state,settings$run_id,baseline$source$revision+1L)
-      changes <- novaTagger::reviewed_taxonomy_diff(before,after)
-      publication_id <- paste0('publish-',review_hash(list(branch=settings$branch,head=event_head,taxonomy=after$taxonomy_checksum,assignments=after$assignment_checksum)))
+      events <- read_events()
+      if(length(events)||!identical(event_head,'baseline')) stop('Create a branch checkpoint before preparing publication.')
+      after <- review_state_to_taxonomy(review_state,settings$run_id,current_baseline$source$revision)
+      publication_id <- paste0('publish-',review_hash(list(branch=settings$branch,taxonomy=after$taxonomy_checksum,assignments=after$assignment_checksum)))
+      changes <- integer()
       publication <- novaTagger::taxonomy_publication_record(after,publication_id,settings$reviewer,settings$branch,base_main_head,changes,note)
-      taxonomy_repository$replace(after,publication)
-      journal$clear()
+      taxonomy_repository$record_publication(after,publication,progress=progress)
       list(id=publication_id,taxonomy=after,publication=publication,changes=changes,base_main_head=base_main_head)
     }
-    merge_publish <- function(prepared) {
+    merge_publish <- function(prepared,progress=NULL) {
+      report_merge <- function(value,message,detail=NULL) if(is.function(progress)) progress(value,message,detail)
+      report_merge(0.10,'Checking main','Confirming that main is still at the commit from which this review started…')
       novaRush::mergeBranch(config,settings$branch,'main',prepared$base_main_head)
+      report_merge(0.55,'Branch merged','Reading the canonical taxonomy back from main…')
       main_repository <- novaTagger::novarush_reviewed_taxonomy_repository(config,graphs,branch='main',query_page_size=500L)
       verified <- main_repository$load(settings$run_id)
       ids <- vapply(verified$review,function(node) as.character(node[['https://schema.org/identifier']] %||% ''),character(1))
       published <- novaTagger::reviewed_taxonomy_from_records(verified)
       if(!prepared$id %in% ids || !identical(published$taxonomy_checksum,prepared$taxonomy$taxonomy_checksum) || !identical(published$assignment_checksum,prepared$taxonomy$assignment_checksum)) stop('The merge returned but main could not be verified. Reconnect before retrying.')
+      report_merge(1,'Published and verified','Main contains the prepared taxonomy and assignment checksums.')
       list(main_head=novaRush::branchHead(config,'main'),publication_id=prepared$id)
     }
-    c(session,list(branches=names,settings=settings,prepared=prepared_existing,
-      prepare_publish=prepare_publish,merge_publish=merge_publish))
+    report(0.93,'Review restored','Preparing the taxonomy editor and category question browser…')
+    list(state=current_session$state,head=current_session$head,save=save,
+      base_main_head=base_main_head,branches=names,settings=settings,
+      prepared=prepared_existing,journal_events=length(existing_events),
+      create_checkpoint=create_checkpoint,
+      prepare_publication=prepare_publication,merge_publish=merge_publish)
   }
   list(list_branches=list_branches,create_branch=create_branch,connect=connect)
 }
@@ -331,24 +436,29 @@ fluree_event_journal <- function(config,graph,branch) {
     property <- 'https://data.nova.org/vocabulary/reviewer/eventPayload'
     base_property <- 'https://data.nova.org/vocabulary/reviewer/baseMainHead'
     reviewer_property <- 'https://data.nova.org/vocabulary/reviewer/createdBy'
-    read_events <- function() {
+    literal_value <- function(value) {
+      if(is.list(value)&&!is.null(value[['@value']])) value[['@value']] else value
+    }
+    read_event_rows <- function() {
       rows <- list();offset <- 0L
       repeat {
-        page <- tryCatch(novaRush::queryNamedGraph(list(select=list('?payload'),
+        page <- tryCatch(novaRush::queryNamedGraph(list(select=list('?event','?payload'),
           where=list(setNames(list('?event','?payload'),c('@id',property))),
           orderBy=list('?event'),limit=500L,offset=offset),graph,config,branch=branch),
           error=function(e) {if(grepl('Unknown named graph',conditionMessage(e),fixed=TRUE)) return(list());stop(e)})
         if(is.data.frame(page)) page <- lapply(seq_len(nrow(page)),function(i) as.list(page[i,,drop=FALSE]))
         if(!length(page)) break
-        rows <- c(rows,lapply(page,function(row) {
-          value <- row[[1]];if(is.list(value)&&!is.null(value[['@value']])) value <- value[['@value']]
-          jsonlite::fromJSON(value,simplifyVector=TRUE)
-        }))
+        rows <- c(rows,lapply(page,function(row) list(
+          id=as.character(literal_value(row[[1]])),
+          payload=as.character(literal_value(row[[2]]))
+        )))
         if(length(page)<500L) break
         offset <- offset+500L
       }
       rows
     }
+    read_events <- function() lapply(read_event_rows(),function(row)
+      jsonlite::fromJSON(row$payload,simplifyVector=TRUE))
     append_event <- function(e) {
       node <- list('@id'=paste0(graph,'/event/',e$id),'@type'='https://data.nova.org/vocabulary/reviewer/Decision')
       node[[property]] <- review_json(e)
@@ -370,21 +480,20 @@ fluree_event_journal <- function(config,graph,branch) {
       novaRush::upsertNamedGraph(node,graph,config,branch=branch)
     }
 
-    clear <- function() {
-      events <- read_events()
-      nodes <- lapply(events,function(e) {
-        node <- list('@id'=paste0(graph,'/event/',e$id),'@type'='https://data.nova.org/vocabulary/reviewer/Decision')
-        node[[property]] <- review_json(e);node
+    clear_events <- function() {
+      rows <- read_event_rows()
+      nodes <- lapply(rows,function(row) {
+        node <- list('@id'=row$id,'@type'='https://data.nova.org/vocabulary/reviewer/Decision')
+        # Fluree deletes exact triples. Preserve the original literal rather
+        # than parsing and re-serializing JSON, which can change list/data-frame
+        # shapes and therefore leave the event untouched.
+        node[[property]] <- row$payload;node
       })
-      metadata <- read_metadata()
-      if(length(metadata)) {
-        node <- list('@id'=paste0(graph,'/workspace'),'@type'='https://data.nova.org/vocabulary/reviewer/Workspace')
-        node[[base_property]] <- metadata$base_main_head;node[[reviewer_property]] <- metadata$reviewer
-        nodes[[length(nodes)+1L]] <- node
-      }
-      if(length(nodes)) novaRush::updateNamedGraph(delete=nodes,graph=graph,config=config,branch=branch)
+      if(length(nodes)) for(batch in split(nodes,ceiling(seq_along(nodes)/100L)))
+        novaRush::updateNamedGraph(delete=unname(batch),graph=graph,config=config,branch=branch)
       invisible(TRUE)
     }
 
-  list(read=read_events,append=append_event,read_metadata=read_metadata,write_metadata=write_metadata,clear=clear)
+  list(read=read_events,append=append_event,read_metadata=read_metadata,
+    write_metadata=write_metadata,clear_events=clear_events,clear=clear_events)
 }

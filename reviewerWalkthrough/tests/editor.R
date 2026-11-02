@@ -33,6 +33,15 @@ x <- edit(s,list(action='merge',target=16,destination=9));stopifnot(all(x$questi
 bad(edit(s,list(action='rename',target=16,label='Alcohol use')))
 bad(edit(s,list(action='remove_level',target=1)))
 x <- edit(s,list(action='add',target=1,label='New domain'));stopifnot(nrow(x$nodes)==32)
+# Individual question moves target leaves, remain undoable and can populate a newly added empty leaf.
+new_leaf <- max(x$nodes$id)
+x <- edit(x,list(action='move_question',question_id='1',destination=new_leaf))
+stopifnot(x$questions$leaf[x$questions$id==1L]==new_leaf,
+  x$placements$decision[x$placements$id==1L]=='moved',1L %in% x$resolved)
+x <- edit(x,list(action='undo'));stopifnot(x$questions$leaf[x$questions$id==1L]==16L)
+bad(edit(s,list(action='move_question',question_id='missing',destination=17L)))
+bad(edit(s,list(action='move_question',question_id='1',destination=2L)))
+bad(edit(s,list(action='move_question',question_id='1',destination=16L)))
 # Durable replay, undo, redo and stale-session protection use the same command journal.
 events <- list();read <- function()events;append <- function(e)events[[length(events)+1L]] <<- e
 session <- new_review_session(s,read,append,'test')
@@ -47,8 +56,12 @@ bad(session$save(list(type='edit',action='rename',target=2,label='X'),session$he
 events <- list();session <- new_review_session(s,function()events,function(e)events[[length(events)+1L]] <<- e,'batch')
 r <- session$save(list(type='edit_batch',commands=list(
   list(type='edit',action='deduplicate'),
-  list(type='edit',action='rename',target=16L,label='Smoking'))),session$head)
-stopifnot(length(events)==1L,events[[1]]$command$type=='edit_batch',node_label(r$state,16L)=='Smoking',!21L %in% r$state$nodes$id)
+  list(type='edit',action='rename',target=16L,label='Smoking'),
+  list(type='edit',action='move_question',question_id='1',destination=17L))),session$head)
+resumed <- new_review_session(s,function()events,function(e)events[[length(events)+1L]] <<- e,'batch')
+stopifnot(length(events)==1L,events[[1]]$command$type=='edit_batch',node_label(r$state,16L)=='Smoking',
+  !21L %in% r$state$nodes$id,r$state$questions$leaf[r$state$questions$id==1L]==17L,
+  resumed$state$questions$leaf[resumed$state$questions$id==1L]==17L)
 # Actual baseline retains all question identities through edits and undo.
 if(nzchar(Sys.getenv('EDITOR_BASELINE'))) {
  real <- readRDS(Sys.getenv('EDITOR_BASELINE'))
@@ -71,9 +84,15 @@ testServer(app_server,{
  # Selecting a tree category drives the bottom question browser automatically.
  session$flushReact()
  stopifnot(grepl('currently smoke',output$editor_inspect_questions$html,ignore.case=TRUE),
-   grepl('of 3',output$editor_inspect_status,fixed=TRUE))
+   grepl('of 3',output$editor_inspect_status,fixed=TRUE),
+   grepl('editor-question-move',output$editor_inspect_questions$html,fixed=TRUE))
  session$setInputs(editor_inspect_search='tried to stop');session$flushReact()
  stopifnot(grepl('of 1',output$editor_inspect_status,fixed=TRUE),
    grepl('tried to stop',output$editor_inspect_questions$html,ignore.case=TRUE))
+ session$setInputs(editor_inspect_search='');session$flushReact()
+ session$setInputs(editor_move_question=list(id='1',nonce=1));session$flushReact()
+ session$setInputs(editor_question_destination='17',editor_question_move_confirm=1);session$flushReact()
+ stopifnot(state()$questions$leaf[state()$questions$id==1L]==17L)
+ session$setInputs(editor_undo=2);stopifnot(state()$questions$leaf[state()$questions$id==1L]==16L)
 })
-cat('PASS: automatic duplicate cleanup, direct edits, cycles, sibling collisions, pending questions, stable membership, undo/redo, batched journal restart, stale sessions, real baseline and editor handlers.\n')
+cat('PASS: automatic duplicate cleanup, direct edits, question moves, cycles, sibling collisions, pending questions, stable membership, undo/redo, batched journal restart, stale sessions, real baseline and editor handlers.\n')

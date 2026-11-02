@@ -1,6 +1,6 @@
 # Taxonomy reviewer
 
-The taxonomy reviewer opens in **live mode** and loads the complete tagged dataset from Fluree. Taxonomy edits are applied immediately in the browser session and are written to the selected review branch only when the reviewer clicks **Save changes**. Closing the browser before saving discards those unsaved edits.
+The taxonomy reviewer opens in **live mode**. Taxonomy edits are applied immediately in the R/Shiny session and are written to the selected review branch journal only when the reviewer clicks **Save progress**. Closing the browser before saving discards those unsaved edits.
 
 ## Launch with the verified full dataset
 
@@ -19,15 +19,16 @@ Required installed packages: `shiny`, `novaRush`, `novaTagger`, `jsonlite` and `
 ## Start and resume a review
 
 1. On **Workspace**, enter the reviewer name. The app lists Fluree branches with a lightweight administration request; it does not load the survey or taxonomy yet.
-2. Select an existing review branch and click **Load selected workspace**. The questions and taxonomy are hydrated once, directly from that branch. Loading `main` first is not required.
+2. Select an existing review branch and click **Load selected workspace**. The fixed question corpus is reused from the app server cache after its first load. The app reads only the branch's current reviewed taxonomy and recent journal; embeddings and historical proposal records are skipped. Loading `main` first is not required.
 3. To start a new review, enter a name such as `review-jaco` and click **Create from main and load**. Branch creation records the `main` commit with lightweight requests and then hydrates only the new branch.
-4. Edit the taxonomy. Repeated same-labelled siblings and safe repeated parent/child levels are cleaned up automatically when the workspace loads; this cleanup remains unsaved and undoable until you click **Save changes**.
-5. Click **Save changes** to persist all pending editor operations as one journal event. Wait for the **Saved** message before closing the app.
-6. To resume later, launch again, choose the same review branch and load it. The saved taxonomy and question assignments are restored.
+4. Edit the taxonomy. Repeated same-labelled siblings and safe repeated parent/child levels are cleaned up automatically when the workspace loads; this cleanup remains unsaved and undoable until you click **Save progress**.
+5. Click **Save progress** to persist all pending editor operations as one journal event. Wait for the **Saved** message before closing the app.
+6. Click **Create branch checkpoint** periodically to materialize and verify the complete current taxonomy on the review branch. The journal is cleared only after verification, and the branch remains editable.
+7. To resume later, choose the same review branch. The latest checkpoint is loaded directly and only events saved after it are replayed.
 
 Changing the branch selector does not load data automatically; click **Load selected workspace** to switch. A failed or unconfirmed save keeps the in-memory draft visible but locks further writes until reload, because the server may already have accepted the event. Loading the branch again restores any event that Fluree accepted.
 
-There is no Reset button in live mode. Start an independent review by creating a new branch from main. On Summary, **Prepare and validate publication** replaces the canonical taxonomy and assignments on the isolated review branch and reads them back. **Merge this taxonomy into main** is enabled only for that prepared state and refuses to publish if main advanced since the review began. Branch deletion is not automated.
+There is no Reset button in live mode. Start an independent review by creating a new branch from main. **Prepare for publication** is available only when the journal is empty after a verified checkpoint; it records the publication and locks the branch. **Publish checkpoint to main** refuses to merge if main advanced since the review began. Branch deletion is not automated.
 
 ## Data and persistence contract
 
@@ -44,19 +45,15 @@ Review decisions are immutable JSON event records in a dedicated named graph on 
 <tagging-base>/reviewer/<branch>
 ```
 
-Each event contains the command, reviewer identity, timestamp, predecessor and a fingerprint of the input baseline. Replaying these events reconstructs the full reviewer draft. One explicit editor save stores the pending commands as a single batched event rather than retransmitting thousands of questions or embeddings. No local file cache is needed to resume.
+Each event contains the command, reviewer identity, timestamp, predecessor and a fingerprint of the input baseline. Replaying the events since the latest checkpoint reconstructs the reviewer draft. One explicit progress save stores the pending commands as a single batched event rather than retransmitting thousands of questions or embeddings.
 
-**The reviewer draft is a separate persisted review layer while it is being edited.** Preparing publication converts that journal into the canonical current taxonomy: explicit parent-linked clusters and direct question-to-leaf assignments. The review branch is verified before it is merged, so pipeline consumers on main continue to see the previous accepted state until publication succeeds.
+**The journal is a short-term recovery layer, while a checkpoint is the materialized branch state.** Checkpointing converts the journal into explicit parent-linked clusters and direct question-to-leaf assignments, verifies the read-back checksums, clears only the journal events, and keeps the branch editable. Publication is a later, separate operation.
 
 A changed source baseline is rejected on resume rather than silently applying old decisions to different data. Stale sessions are rejected before saving. Simultaneous conflicting events are retained and detected as a fork; loading stops for reconciliation rather than silently choosing a winner. Use a separate branch per reviewer. Publication also records the base main commit and rejects a merge when main has advanced.
 
-## Fit labels and suggestions
+## Reviewer load profile
 
-The app uses the latest saved accepted/edited leaf-label assessments: score below 0.5 is red, 0.5–0.65 amber, and at least 0.65 green. Missing assessments are amber, not invented green ratings. Missing leaf placements are red. The verified baseline produces 6,674 red, 3,434 amber and 693 green question occurrences.
-
-For red questions, alternative destinations are calculated locally from the already-persisted question vectors and leaf centroids, in bounded batches. A suggestion is shown only when an alternative improves the score by at least 0.1. The verified baseline produces 1,518 suggestions. No external model request is made and no question-by-question square matrix is constructed.
-
-These are baseline assessments and suggestions, not fresh model judgements after reviewer edits. Reviewers choose the final destination. Removed destinations are rejected; new leaves do not automatically receive new model suggestions.
+The taxonomy editor does not load question embeddings or historical proposal/review records. It needs question identifiers and captions, the current hierarchy, current assignments, and the short journal since the latest checkpoint. No external model request is made during review.
 
 ## Original demo
 

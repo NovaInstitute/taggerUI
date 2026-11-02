@@ -1,12 +1,12 @@
 # Presentation only: commands are validated and applied by novaTagger.
 editor_ui <- function() tagList(
-  div(class='page-heading',h2('Shape your taxonomy'),p('Rename, move or combine categories. Changes stay in this browser session until you choose Save changes.')),
-  div(class='editor-toolbar',actionButton('editor_save','Save changes',class='btn-primary'),actionButton('editor_discard','Discard unsaved'),
+  div(class='page-heading',h2('Shape your taxonomy'),p('Rename, move or combine categories. Changes stay in this browser session until you choose Save progress.')),
+  div(class='editor-toolbar',actionButton('editor_save','Save progress',class='btn-primary'),actionButton('editor_discard','Discard unsaved'),
       actionButton('editor_undo','Undo'),actionButton('editor_redo','Redo'),actionButton('editor_expand','Expand all'),actionButton('editor_close','Close branches'),textOutput('editor_status',inline=TRUE)),
   div(class='editor-grid',div(class='card editor-browser',textInput('editor_search','Find a category',placeholder='Search names or paths…'),uiOutput('editor_tree')),
       div(class='card editor-inspector',uiOutput('editor_details'))),
   div(class='card editor-question-browser',h3('Inspect questions by category'),
-    p(class='muted','Choose a category to browse every question beneath it. Results are paged so large categories remain responsive.'),
+    p(class='muted','Choose a category to browse every question beneath it. Move an obvious mismatch to another leaf category; it remains an unsaved draft change until you choose Save progress.'),
     fluidRow(column(7,selectizeInput('editor_inspect_category','Category',choices=NULL)),
       column(5,textInput('editor_inspect_search','Filter question wording',placeholder='Optional search…'))),
     div(class='question-browser-controls',actionButton('editor_inspect_previous','Previous'),
@@ -18,6 +18,7 @@ editor_server <- function(input,output,session,state,apply_draft,save_draft,disc
   pending <- reactiveVal(NULL)
   inspect_page <- reactiveVal(1L)
   inspect_category <- reactiveVal(1L)
+  question_to_move <- reactiveVal(NULL)
   inspect_page_size <- 100L
   observeEvent(input$editor_select,{
     id <- as.integer(input$editor_select)
@@ -117,13 +118,18 @@ editor_server <- function(input,output,session,state,apply_draft,save_draft,disc
     first <- (inspect_page()-1L)*inspect_page_size+1L;last <- min(nrow(q),inspect_page()*inspect_page_size)
     rows <- q[first:last,,drop=FALSE]
     tags$ol(start=first,class='all-question-list',lapply(seq_len(nrow(rows)),function(i) tags$li(
-      p(rows$text[i]),span(class='path',node_path(s,rows$leaf[i])),
-      if('source_form_id' %in% names(rows) && !is.na(rows$source_form_id[i]) && nzchar(rows$source_form_id[i]))
-        span(class='muted',paste(' · Source:',rows$source_form_id[i])))))
+      p(rows$text[i]),div(class='question-list-meta',div(span(class='path',node_path(s,rows$leaf[i])),
+        if('source_form_id' %in% names(rows) && !is.na(rows$source_form_id[i]) && nzchar(rows$source_form_id[i]))
+          span(class='muted',paste(' · Source:',rows$source_form_id[i]))),
+        tags$button(type='button',class='btn btn-default btn-sm editor-question-move',
+          `data-question`=as.character(rows$id[i]),'Move question')))))
   })
   observeEvent(input$editor_inspect_previous,inspect_page(max(1L,inspect_page()-1L)))
   observeEvent(input$editor_inspect_next,inspect_page(min(inspect_pages(),inspect_page()+1L)))
-  run <- function(command) tryCatch({if(editable()) apply_draft(command)},error=function(e) showNotification(conditionMessage(e),type='error'))
+  run <- function(command) tryCatch({
+    if(!editable()) return(FALSE)
+    isTRUE(apply_draft(command))
+  },error=function(e) {showNotification(conditionMessage(e),type='error');FALSE})
   preview <- function(command) {
     if(!editable()) return()
     tryCatch({
@@ -136,6 +142,28 @@ editor_server <- function(input,output,session,state,apply_draft,save_draft,disc
     },error=function(e) showNotification(conditionMessage(e),type='error'))
   }
   command <- function(action,...) c(list(type='edit',action=action,target=selected()),list(...))
+  observeEvent(input$editor_move_question,{
+    if(!editable()) return()
+    id <- as.character(input$editor_move_question$id %||% '')
+    s <- state();row <- match(id,as.character(s$questions$id))
+    if(is.na(row)) return(showNotification('That question is no longer available in this draft.',type='error'))
+    leaves <- leaf_ids(s);leaves <- setdiff(leaves,s$questions$leaf[row])
+    if(!length(leaves)) return(showNotification('There is no other leaf category to move this question to.',type='warning'))
+    choices <- setNames(leaves,vapply(leaves,function(x) node_path(s,x),character(1)))
+    question_to_move(id)
+    showModal(modalDialog(title='Move this question',p(s$questions$text[row]),
+      p(class='path',paste('Currently:',node_path(s,s$questions$leaf[row]))),
+      selectizeInput('editor_question_destination','Move to leaf category',choices=choices,
+        options=list(placeholder='Search category names…')),
+      p(class='muted','This changes the local draft. Use Save progress when you are ready to persist it to the branch journal.'),
+      footer=tagList(modalButton('Cancel'),actionButton('editor_question_move_confirm','Move question',class='btn-primary'))))
+  })
+  observeEvent(input$editor_question_move_confirm,{
+    req(question_to_move())
+    moved <- run(list(type='edit',action='move_question',question_id=question_to_move(),
+      destination=as.integer(input$editor_question_destination)))
+    if(moved) {question_to_move(NULL);removeModal()}
+  })
   observeEvent(input$editor_confirm,{req(pending());x<-pending();pending(NULL);removeModal();run(x)})
   observeEvent(input$editor_rename_save,run(command('rename',label=input$editor_label)))
   observeEvent(input$editor_inline_rename,run(list(type='edit',action='rename',target=as.integer(input$editor_inline_rename$id),label=input$editor_inline_rename$label)))
