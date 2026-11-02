@@ -13,6 +13,7 @@ Imports:
     DT,
     dplyr,
     jsonlite,
+    later,
     novaRush,
     novaTagger,
     shiny,

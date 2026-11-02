@@ -13,6 +13,8 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
   branch_status <- reactiveVal(if(demo) 'Branches are ready.' else 'Checking available branches…')
   locked <- reactiveVal(FALSE)
   prepared <- reactiveVal(NULL)
+  checkpoint_dirty <- reactiveVal(FALSE)
+  last_checkpoint <- reactiveVal(NULL)
   initialise_draft <- function(persisted,branch) {
     saved_state(persisted);draft_commands(list());state(persisted)
     if(branch=='main') return(invisible(FALSE))
@@ -42,9 +44,29 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
     })
   }
   load_live <- function(settings) {
-    connected(FALSE);locked(TRUE);prepared(NULL);save_status('Loading the saved dataset…')
-    result <- withProgress(message='Loading saved questions and review',value=0.2,backend$connect(settings))
+    progress <- shiny::Progress$new(session,min=0,max=1)
+    progress_closed <- FALSE
+    close_progress <- function() {
+      if(!progress_closed) {progress$close();progress_closed <<- TRUE}
+      invisible(NULL)
+    }
+    report_progress <- function(value,message,detail=NULL)
+      progress$set(value=value,message=message,detail=detail)
+    completed <- FALSE
+    session$onSessionEnded(function() close_progress())
+    on.exit({
+      if(!completed) {
+        locked(FALSE)
+        save_status('Workspace load failed. Check the error message and try again.')
+        close_progress()
+      }
+    },add=TRUE)
+    connected(FALSE);locked(TRUE);prepared(NULL);checkpoint_dirty(FALSE);last_checkpoint(NULL);save_status('Loading the saved dataset…')
+    report_progress(0.01,'Connecting to Fluree',paste('Opening',settings$branch,'…'))
+    result <- backend$connect(settings,progress=report_progress)
+    report_progress(0.95,'Preparing the editor','Applying automatic taxonomy cleanup and restoring your selection…')
     live(result);saved_head(result$head);branches(result$branches);active(settings$branch);prepared(result$prepared %||% NULL)
+    checkpoint_dirty(isTRUE((result$journal_events %||% 0L)>0L))
     cleaned <- if(is.null(result$prepared)) initialise_draft(result$state,settings$branch) else {
       saved_state(result$state);draft_commands(list());state(result$state);FALSE
     }
@@ -53,6 +75,14 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
       paste(nrow(result$state$questions),'questions loaded. Repeated categories were cleaned up and are ready to save.') else
       paste(nrow(result$state$questions),'questions loaded. Saved decisions restored.'))
     updateSelectizeInput(session,'branch',choices=result$branches,selected=settings$branch)
+    report_progress(0.99,'Rendering the workspace','Waiting for the active branch and taxonomy editor to finish updating…')
+    completed <- TRUE
+    # Only announce completion after every invalidated output (including the
+    # active-workspace banner and taxonomy tree) has been sent to the browser.
+    session$onFlushed(function() {
+      progress$set(value=1,message='Workspace ready',detail=paste(settings$branch,'is active and ready to use.'))
+      later::later(close_progress,delay=0.6)
+    },once=TRUE)
   }
   commit <- function(command) {
     if(!editable()) return()
@@ -62,7 +92,7 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
     locked(TRUE);save_status('Saving your decision…')
     tryCatch({
       result <- withProgress(message='Saving decision',value=0.5,live()$save(command,saved_head()))
-      state(result$state);saved_head(result$head);locked(FALSE)
+      state(result$state);saved_head(result$head);checkpoint_dirty(TRUE);locked(FALSE)
       save_status(paste('Saved',format(Sys.time(),'%H:%M:%S'), '· safe to close and resume later.'))
     },error=function(e) {
       save_status('Save not confirmed. Reconnect to restore the last saved state before continuing.')
@@ -87,7 +117,7 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
     locked(TRUE);save_status('Saving taxonomy changes…')
     tryCatch({
       result <- withProgress(message='Saving taxonomy changes',value=0.5,live()$save(command,saved_head()))
-      state(result$state);saved_state(result$state);saved_head(result$head);draft_commands(list());locked(FALSE)
+      state(result$state);saved_state(result$state);saved_head(result$head);draft_commands(list());checkpoint_dirty(TRUE);locked(FALSE)
       save_status(paste('Saved',format(Sys.time(),'%H:%M:%S'),'· safe to close and resume later.'))
     },error=function(e) {
       save_status('Save not confirmed. Your edits remain visible, but reconnect before making more changes.')
@@ -203,30 +233,57 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
   output$publish_status <- renderUI({
     if(demo) return(NULL)
     if(!connected()) return(p(class='muted','Connect to a review branch to prepare a publication.'))
-    if(is.null(live()$prepare_publish)) return(p(class='muted','Local draft: changes are saved locally. Fluree publication is unavailable in this session.'))
+    if(is.null(live()$create_checkpoint)) return(p(class='muted','Local draft: Fluree checkpointing is unavailable in this session.'))
     if(active()=='main') return(p(class='muted','Main is the current published taxonomy. Create a review branch to make the next revision.'))
-    if(length(draft_commands())) return(p(class='notice','Save your taxonomy changes before preparing this branch for publication.'))
+    if(length(draft_commands())) return(p(class='notice','Save your taxonomy changes before creating a branch checkpoint.'))
     value <- prepared()
     if(is.null(value)) return(tagList(
-      p('Preparation replaces the canonical taxonomy on this isolated branch, reads it back, and leaves main unchanged.'),
-      textAreaInput('publication_note','Publication note',rows=2,placeholder='Optional summary for the next reviewer'),
-      actionButton('prepare_publish','Prepare and validate publication',class='btn-primary')
+      h3('Branch checkpoint'),
+      p(if(checkpoint_dirty()) 'Saved journal changes are waiting to be materialized.' else 'The journal is empty; the branch taxonomy is already materialized.'),
+      p('A checkpoint writes the complete current taxonomy to this review branch, verifies it, clears the journal, and keeps the branch editable.'),
+      actionButton('create_checkpoint','Create branch checkpoint',class='btn-primary'),
+      tags$hr(),h3('Publication'),
+      if(checkpoint_dirty()) p(class='notice','Create a checkpoint before preparing this branch for publication.') else tagList(
+        textAreaInput('publication_note','Publication note',rows=2,placeholder='Optional summary for the next reviewer'),
+        actionButton('prepare_publication','Prepare for publication',class='btn-default')
+      )
     ))
     counts <- value$changes
     tagList(
       div(class='notice',strong('Ready to merge'),p(paste('Publication:',value$id)),
           p(paste(names(counts),counts,collapse=' · '))),
-      actionButton('merge_publish','Merge this taxonomy into main',class='btn-primary')
+      actionButton('merge_publish','Publish checkpoint to main',class='btn-primary')
     )
   })
-  observeEvent(input$prepare_publish,{
+  observeEvent(input$create_checkpoint,{
     req(!demo,connected(),live(),active()!='main')
     if(locked()||!is.null(prepared())) return()
-    if(length(draft_commands())) {showNotification('Save taxonomy changes before preparing publication.',type='warning');return()}
-    locked(TRUE);save_status('Preparing the canonical taxonomy on this review branch…')
+    if(length(draft_commands())) {showNotification('Save taxonomy changes before creating a checkpoint.',type='warning');return()}
+    locked(TRUE);save_status('Materializing and verifying the current taxonomy on this review branch…')
     tryCatch({
-      result <- withProgress(message='Preparing publication',value=0.5,
-        live()$prepare_publish(state(),saved_head(),input$publication_note %||% ''))
+      result <- withProgress(message='Creating branch checkpoint',value=0,{
+        reporter <- function(value,message,detail=NULL) setProgress(value=value,message=message,detail=detail)
+        live()$create_checkpoint(state(),saved_head(),reporter)
+      })
+      state(result$state);saved_state(result$state);saved_head(result$head)
+      draft_commands(list());checkpoint_dirty(FALSE);last_checkpoint(result);locked(FALSE)
+      save_status(paste('Checkpoint',result$id,'verified. Journal cleared; this branch remains editable.'))
+      showNotification('Branch checkpoint saved and verified.',type='message')
+    },error=function(e) {
+      locked(FALSE);save_status('Checkpoint was not confirmed. The saved journal was retained; reconnect before retrying.')
+      showNotification(conditionMessage(e),type='error',duration=NULL)
+    })
+  })
+  observeEvent(input$prepare_publication,{
+    req(!demo,connected(),live(),active()!='main')
+    if(locked()||!is.null(prepared())) return()
+    if(length(draft_commands())||checkpoint_dirty()) {showNotification('Save progress and create a branch checkpoint first.',type='warning');return()}
+    locked(TRUE);save_status('Preparing the verified branch checkpoint for publication…')
+    tryCatch({
+      result <- withProgress(message='Preparing publication',value=0,{
+        reporter <- function(value,message,detail=NULL) setProgress(value=value,message=message,detail=detail)
+        live()$prepare_publication(state(),saved_head(),input$publication_note %||% '',reporter)
+      })
       prepared(result);save_status('Publication prepared and verified. Main is still unchanged.')
     },error=function(e) {
       locked(FALSE);save_status('Publication preparation failed. The review branch remains isolated from main.')
@@ -237,8 +294,10 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
     req(!demo,connected(),live(),prepared(),active()!='main')
     save_status('Merging the prepared taxonomy into main…')
     tryCatch({
-      result <- withProgress(message='Publishing to main',value=0.5,
-        live()$merge_publish(prepared()))
+      result <- withProgress(message='Publishing to main',value=0,{
+        reporter <- function(value,message,detail=NULL) setProgress(value=value,message=message,detail=detail)
+        live()$merge_publish(prepared(),reporter)
+      })
       settings <- live()$settings;settings$branch <- 'main'
       load_live(settings)
       save_status(paste('Published and verified on main:',result$publication_id))
@@ -255,7 +314,7 @@ app_server <- function(input,output,session, demo=identical(Sys.getenv("NOVA_REV
   )
   observeEvent(input$reset,{
     if(!demo) return()
-    state(mock_state());saved_state(mock_state());draft_commands(list());branches(c('main','review-alex'));active('review-alex');drafts(list(main=mock_state(),'review-alex'=mock_state()));connected(FALSE);prepared(NULL)
+    state(mock_state());saved_state(mock_state());draft_commands(list());branches(c('main','review-alex'));active('review-alex');drafts(list(main=mock_state(),'review-alex'=mock_state()));connected(FALSE);prepared(NULL);checkpoint_dirty(FALSE);last_checkpoint(NULL)
     updateSelectInput(session,'branch',choices=branches(),selected='review-alex');updateTextInput(session,'branch_name',value='');updateTabsetPanel(session,'page',selected='workspace')
   })
 }
