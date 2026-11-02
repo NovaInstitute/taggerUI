@@ -1,12 +1,42 @@
 (function () {
-  const open = new Set(['1']);
+  // Shiny replaces the contents of editor_tree whenever the draft changes.
+  // Keep disclosure state outside that replaceable DOM so an edit does not
+  // collapse the reviewer back to the root of the taxonomy.
+  const openBranches = new Set(['1']);
   let drag = null;
+
+  function rememberOpenBranches(tree) {
+    if (!tree) return;
+    tree.querySelectorAll('.editor-branch').forEach(branch => {
+      const id = branch.dataset.branch;
+      if (branch.open) openBranches.add(id); else openBranches.delete(id);
+    });
+    openBranches.add('1');
+  }
+
+  function restoreOpenBranches(tree) {
+    if (!tree) return;
+    tree.querySelectorAll('.editor-branch').forEach(branch => {
+      branch.open = branch.dataset.branch === '1' || openBranches.has(branch.dataset.branch);
+    });
+  }
+
   document.addEventListener('toggle', e => {
     if (e.target.matches('.editor-branch')) {
+      if (!e.target.isConnected) return;
       const id = e.target.dataset.branch;
-      if (e.target.open) open.add(id); else open.delete(id);
+      if (e.target.open) openBranches.add(id); else openBranches.delete(id);
+      openBranches.add('1');
     }
   }, true);
+
+  // Capture the current state while the old tree is still present. The
+  // MutationObserver below restores it as soon as Shiny inserts the new tree.
+  document.addEventListener('shiny:recalculating', e => {
+    if (e.target && e.target.id === 'editor_tree') {
+      rememberOpenBranches(e.target);
+    }
+  });
   function rename(row) {
     const button = row.querySelector('.editor-select');
     if (!button || row.querySelector('input')) return;
@@ -23,6 +53,12 @@
     input.addEventListener('blur',()=>finish(false));
   }
   document.addEventListener('click', e => {
+    const moveQuestion=e.target.closest('.editor-question-move');
+    if(moveQuestion){
+      e.preventDefault();e.stopPropagation();
+      Shiny.setInputValue('editor_move_question',{id:moveQuestion.dataset.question,nonce:Date.now()},{priority:'event'});
+      return;
+    }
     const button=e.target.closest('.editor-select,.editor-rename');
     if(!button)return;
     e.preventDefault();e.stopPropagation();
@@ -40,9 +76,24 @@
     row.classList.remove('drop-target');Shiny.setInputValue('editor_drop',{source:drag,destination:row.dataset.node},{priority:'event'});drag=null;
   });
   document.addEventListener('dragend',()=>{drag=null;document.querySelectorAll('.drop-target').forEach(x=>x.classList.remove('drop-target'));});
-  document.addEventListener('shiny:connected',()=>{
-    Shiny.addCustomMessageHandler('editorExpand',value=>document.querySelectorAll('.editor-branch').forEach(x=>{x.open=value||x.dataset.branch==='1';}));
+  let treeStateInitialised = false;
+  function initialiseTreeState() {
+    if (treeStateInitialised || !window.Shiny) return;
     const tree=document.getElementById('editor_tree');
-    if(tree)new MutationObserver(()=>tree.querySelectorAll('.editor-branch').forEach(x=>{if(open.has(x.dataset.branch))x.open=true;})).observe(tree,{childList:true,subtree:true});
-  });
+    if(!tree)return;
+    treeStateInitialised = true;
+    Shiny.addCustomMessageHandler('editorExpand',value=>{
+      openBranches.clear();
+      tree.querySelectorAll('.editor-branch').forEach(branch=>{
+        branch.open=value||branch.dataset.branch==='1';
+        if(branch.open)openBranches.add(branch.dataset.branch);
+      });
+      openBranches.add('1');
+    });
+    restoreOpenBranches(tree);
+    new MutationObserver(()=>restoreOpenBranches(tree)).observe(tree,{childList:true,subtree:true});
+  }
+  document.addEventListener('shiny:connected',initialiseTreeState);
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initialiseTreeState);
+  else initialiseTreeState();
 })();
