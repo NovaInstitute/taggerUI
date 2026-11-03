@@ -3,6 +3,34 @@
 .review_workspace_cache <- new.env(parent=emptyenv())
 review_json <- function(x) as.character(jsonlite::toJSON(x, auto_unbox=TRUE, null='null', na='null', digits=NA))
 review_hash <- function(x) digest::digest(review_json(x), algo='sha256', serialize=FALSE)
+review_question_page_size <- function() {
+  value <- suppressWarnings(as.integer(Sys.getenv('NOVA_REVIEW_PAGE_SIZE','500')))
+  if(length(value)!=1L||is.na(value)||value<1L) 500L else value
+}
+valid_review_questions <- function(questions) {
+  required <- c('id','iri','caption','procedure_id','source_form_id','element_order')
+  is.data.frame(questions)&&nrow(questions)>0L&&all(required %in% names(questions))&&
+    !anyDuplicated(as.character(questions$id))
+}
+review_question_cache_file <- function(key) {
+  directory <- Sys.getenv('NOVA_REVIEW_CACHE_DIR','')
+  if(!nzchar(directory)) directory <- file.path(tools::R_user_dir('taggerUI','cache'),'review-questions')
+  if(!dir.exists(directory)) try(dir.create(directory,recursive=TRUE,showWarnings=FALSE),silent=TRUE)
+  if(!dir.exists(directory)) return(NULL)
+  file.path(directory,paste0(key,'.rds'))
+}
+read_review_question_cache <- function(path) {
+  if(is.null(path)||!file.exists(path)) return(NULL)
+  value <- tryCatch(readRDS(path),error=function(e) NULL)
+  if(valid_review_questions(value)) value else NULL
+}
+write_review_question_cache <- function(questions,path) {
+  if(is.null(path)||!valid_review_questions(questions)) return(invisible(FALSE))
+  temporary <- tempfile('questions-',tmpdir=dirname(path),fileext='.rds')
+  saved <- tryCatch({saveRDS(questions,temporary,compress=TRUE);file.rename(temporary,path)},error=function(e) FALSE)
+  if(file.exists(temporary)) unlink(temporary)
+  invisible(isTRUE(saved))
+}
 empty_review_state <- function() list(
   nodes=data.frame(id=1L,parent=NA_integer_,label='Survey questions',stable_id='root'),
   questions=data.frame(id=character(),text=character(),leaf=integer(),fit=character(),suggested=integer(),reason=character()),
@@ -292,15 +320,31 @@ fluree_review_backend <- function() {
     names <- list_branches(settings)
     if(!settings$branch %in% names) stop('That branch no longer exists. Refresh the branch list and choose another workspace.')
     locations <- locations_for(settings);survey <- locations$survey;base <- locations$base
-    question_key <- review_hash(list(url=settings$url,ledger=settings$ledger,survey=survey))
-    if(exists(question_key,envir=.review_workspace_cache,inherits=FALSE)) {
+    question_key <- review_hash(list(schema='review-question-projection-v1',url=settings$url,ledger=settings$ledger,survey=survey))
+    cache_file <- review_question_cache_file(question_key)
+    refresh_questions <- tolower(Sys.getenv('NOVA_REVIEW_REFRESH_QUESTIONS','false')) %in% c('1','true','yes')
+    disk_questions <- if(refresh_questions) NULL else read_review_question_cache(cache_file)
+    if(!refresh_questions&&exists(question_key,envir=.review_workspace_cache,inherits=FALSE)) {
       report(0.14,'Loading cached questions','Reusing the fixed survey corpus already loaded by this app server…')
       questions <- get(question_key,envir=.review_workspace_cache,inherits=FALSE)
-    } else {
-      report(0.14,'Loading survey questions','Reading the fixed question corpus from main for the first server session…')
-      main_config <- config_for(settings,'main')
-      questions <- novaTagger::query_taggable_questions(main_config,graph=survey,branch='main',page_size=500L)
+    } else if(!is.null(disk_questions)) {
+      report(0.20,'Loading cached questions','Restoring the fixed survey corpus from the server cache; no Fluree survey scan is needed…')
+      questions <- disk_questions
       assign(question_key,questions,envir=.review_workspace_cache)
+    } else {
+      page_size <- review_question_page_size()
+      report(0.14,'Loading survey questions',paste('Reading only question IDs, text and provenance from main in pages of',page_size,'…'))
+      main_config <- config_for(settings,'main')
+      questions <- novaTagger::query_review_questions(
+        main_config,graph=survey,branch='main',page_size=page_size,
+        on_page=function(loaded,page_rows,source_index,source_total,source_form_id) {
+          value <- min(0.32,0.14+0.18*loaded/12000)
+          report(value,'Loading survey questions',paste(
+            format(loaded,big.mark=','),'questions loaded;',
+            'source form',source_index,'of',source_total,'…'))
+        })
+      assign(question_key,questions,envir=.review_workspace_cache)
+      write_review_question_cache(questions,cache_file)
     }
     report(0.34,'Questions ready',paste(format(nrow(questions),big.mark=','),'questions available. Checking for a materialized taxonomy checkpoint…'))
     graphs <- setNames(as.list(paste0(base,c('run','embedding','hierarchy','review'))),c('run','embedding','hierarchy','review'))

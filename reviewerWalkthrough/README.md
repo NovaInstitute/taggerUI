@@ -53,7 +53,21 @@ A changed source baseline is rejected on resume rather than silently applying ol
 
 ## Reviewer load profile
 
-The taxonomy editor does not load question embeddings or historical proposal/review records. It needs question identifiers and captions, the current hierarchy, current assignments, and the short journal since the latest checkpoint. No external model request is made during review.
+The taxonomy editor does not load question embeddings, answer options, response
+semantics or historical proposal/review records during the normal path. Its
+survey query selects only question identifiers, captions, procedure/form
+provenance and element order in bounded pages. It then loads the current
+hierarchy, current assignments, and the short journal since the latest
+checkpoint. No external model request is made during review.
+
+The fixed question projection is cached in the app process and in the server
+user's standard cache directory. Consequently, later reviewers and app restarts
+do not rescan the survey graph. Set `NOVA_REVIEW_CACHE_DIR` to choose a durable
+cache directory, `NOVA_REVIEW_PAGE_SIZE` to override the default 500-row Fluree
+page size on a constrained server, or `NOVA_REVIEW_REFRESH_QUESTIONS=true` for
+one launch when the supposedly fixed survey baseline has intentionally changed.
+Old journal branches retain the same fingerprint because the lightweight
+projection includes every provenance field consumed by review-state replay.
 
 ## Original demo
 
