@@ -18,6 +18,17 @@ raw <- list(run_id='real-fixture',revision=17L,
 baseline <- review_from_pipeline(raw)
 stopifnot(identical(baseline$questions$id,sort(raw$questions$id)),sum(baseline$questions$fit=='red')==2,baseline$questions$fit[1]=='green')
 stopifnot(baseline$questions$leaf[4]==1L,length(queue_ids(baseline))==2)
+# The lightweight server projection retains every field that contributes to a
+# review baseline fingerprint. Old branches therefore replay the same journal
+# even though response metadata and answer options are no longer hydrated.
+rich_raw <- raw
+rich_raw$questions$iri <- paste0('https://example.org/',rich_raw$questions$id)
+rich_raw$questions$procedure_id <- 'https://example.org/procedure'
+rich_raw$questions$element_order <- seq_len(nrow(rich_raw$questions))
+rich_raw$questions$unused_response_metadata <- 'not consumed by review state'
+lean_raw <- rich_raw
+lean_raw$questions <- lean_raw$questions[,c('id','caption','procedure_id','source_form_id','element_order','iri')]
+stopifnot(identical(review_hash(review_from_pipeline(rich_raw)),review_hash(review_from_pipeline(lean_raw))))
 # The canonical publication projection round-trips stable tree identities,
 # assignments, and progress independently of the journal.
 published <- review_state_to_taxonomy(baseline,raw$run_id,raw$revision+1L)
